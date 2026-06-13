@@ -1,0 +1,68 @@
+# yggdrasil-nim example configuration
+
+[Node]
+# Long-term key file. If it does not exist, a new identity is generated.
+keyfile = "yggdrasil.key"
+# Optional display name for admin/API output.
+name = "example-node"
+
+[Peers]
+# Static peers. IP addresses are allowed directly and bypass DNS.
+static = [
+  "quic://203.0.113.10:12345",
+  "tcp+tls://[2001:db8::10]:12345",
+]
+multicast = true
+multicastAddress = "ff02::114"
+multicastPort = 12345
+# Public peer lists may be HTTP or HTTPS and may use literal IP addresses.
+publicPeerLists = ["https://example.net/ygg/peers.txt"]
+peerExchange = true
+
+[CKR]
+# Routes may be changed at runtime through JSON-RPC.
+# Static route example:
+# [[CKR.routes]]
+# id = "office-v4"
+# remoteKey = "hex-public-key"
+# destinationSubnets = ["10.42.0.0/16"]
+# allowedSourceSubnets = ["10.10.0.0/16", "fd00:abcd::/48"]
+# dynamic = false
+
+[TUN]
+enable = true
+name = "ygg0"
+mtu = 65535
+# Optional override. Normally derived from the public key.
+ipv6 = ""
+# Optional internal IPv4 address for legacy local services.
+ipv4 = "10.255.0.1/32"
+
+[Proxy]
+enable = false
+# Use localhost to bind both 127.0.0.1 and ::1 for curl compatibility.
+listen = "localhost:1080"
+socks5 = true
+http = true
+
+[DNS]
+enable = true
+# Use localhost to bind both 127.0.0.1 and ::1 for local DNS clients.
+listen = "localhost:5053"
+internalDomain = ".yg"
+hostsFile = "hosts.yg"
+upstream = ["1.1.1.1:53", "8.8.8.8:53"]
+
+[Admin]
+# Multiple listen addresses are supported. `unix://` works on POSIX.
+listen = ["unix://yggdrasil-admin.sock", "tcp://127.0.0.1:9001"]
+keepalive = true
+
+[Crypto]
+# The checked-in default backend is development-only. Production builds should
+# enable these and fail closed if dependencies are unavailable.
+postQuantum = true
+kem = "ML-KEM-1024"
+identityCertificate = "Dilithium5+Ed25519"
+aead = "ChaCha20-Poly1305"
+perHopProtection = true
