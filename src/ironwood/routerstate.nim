@@ -233,7 +233,10 @@ proc addPeer*(r: var RouterState, remoteKey: NodeId, priority: uint8 = 0): Route
   r.blooms.setOnTree(remoteKey, true) # direct peers are eligible in the minimal router
   result.addEvent(rePeerAdded, "port=" & $port, some(id), some(remoteKey))
   result.outbound.add r.peers[id].action(makeKeepAlive())
-  result.outbound.add r.peers[id].action(r.peers[id].makeSigReq(randomNonce()))
+  # SigReq seq MUST be announces[selfKey].seq + 1, matching Go ironwood's _newReq
+  let sigReqSeq = r.announces[r.crypto.publicKey].seq + 1
+  stderr.writeLine "[ironwood] addPeer key=" & short(remoteKey) & " port=" & $port & " sigReqSeq=" & $sigReqSeq
+  result.outbound.add r.peers[id].action(r.peers[id].makeSigReq(sigReqSeq, randomNonce()))
   let bf = r.blooms.getBloomFor(remoteKey, r.crypto.publicKey)
   result.outbound.add r.peers[id].action(encodeFrame(iwProtoBloomFilter, bf.encode()))
 
@@ -252,16 +255,18 @@ proc bestPeerForKey(r: var RouterState, key: NodeId): Option[PeerId] =
     if r.peerByKey.hasKey(t): return some(r.peerByKey[t])
   none(PeerId)
 
-proc routeSessionData(r: var RouterState, dest: NodeId, data: seq[byte], step: var RouterStep) =
+proc routeSessionData*(r: var RouterState, dest: NodeId, data: seq[byte], step: var RouterStep) =
   let pid = r.bestPeerForKey(dest)
   if pid.isNone:
     step.addEvent(reNoRoute, "session dest=" & short(dest), key = some(dest))
+    stderr.writeLine "[ironwood] routeSessionData dest=" & short(dest) & " NO ROUTE"
     discard r.pathfinder.ensureRumor(dest)
     return
   let p = r.peers[pid.get()]
   let path = r.pathfinder.getPath(dest).get(r.cachedCoords(dest))
   let tr = Traffic(path: path, fromPath: r.cachedCoords(r.crypto.publicKey), source: r.crypto.publicKey,
                    dest: dest, watermark: high(uint64), payload: data)
+  stderr.writeLine "[ironwood] routeSessionData dest=" & short(dest) & " via peer=" & short(p.remoteKey) & " pathLen=" & $path.len
   step.outbound.add p.action(encodeTrafficFrame(tr))
 
 proc sendPathNotifyTo*(r: var RouterState, peerId: PeerId, requester: NodeId, requestedSource: NodeId,
@@ -324,12 +329,17 @@ proc responseCost(r: RouterState, parent: NodeId): uint64 =
 
 proc adoptParent(r: var RouterState, parent: NodeId, res: SigResFull): bool =
   let ann = makeChildAnnounce(r.crypto, parent, res.seq, res.nonce, res.port, res.parentSignature.toSig64())
-  r.updateAnnounce(ann)
+  let ok = r.updateAnnounce(ann)
+  stderr.writeLine "[ironwood] adoptParent parent=" & short(parent) & " seq=" & $res.seq & " port=" & $res.port & " accepted=" & $ok
+  ok
 
 proc becomeRoot(r: var RouterState): bool =
-  inc r.ownSeq
-  let ann = makeRootAnnounce(r.crypto, r.ownSeq, randomNonce())
-  r.updateAnnounce(ann)
+  # Must use announces[selfKey].seq + 1 like Go ironwood's _becomeRoot
+  let newSeq = r.announces[r.crypto.publicKey].seq + 1
+  let ann = makeRootAnnounce(r.crypto, newSeq, randomNonce())
+  let ok = r.updateAnnounce(ann)
+  stderr.writeLine "[ironwood] becomeRoot seq=" & $newSeq & " accepted=" & $ok
+  ok
 
 proc expireInfos*(r: var RouterState) =
   let now = getTime()
@@ -416,8 +426,10 @@ proc fixParent*(r: var RouterState): RouterStep =
 
 proc maintenanceSigReqs*(r: var RouterState): seq[FrameAction] =
   r.responses.clear()
+  # SigReq seq MUST be announces[selfKey].seq + 1, matching Go ironwood's _newReq
+  let sigReqSeq = r.announces[r.crypto.publicKey].seq + 1
   for _, p in r.peers.mpairs:
-    result.add p.action(p.makeSigReq(randomNonce()))
+    result.add p.action(p.makeSigReq(sigReqSeq, randomNonce()))
 
 proc maintenance*(r: var RouterState): RouterStep =
   ## Periodic orchestrator tick. Sends SigReq refreshes, runs parent/root
@@ -452,10 +464,12 @@ proc maintenance*(r: var RouterState): RouterStep =
 
 proc sendAppData*(r: var RouterState, dest: NodeId, data: openArray[byte]): RouterStep =
   if not r.pathfinder.hasPath(dest) and not r.peerByKey.hasKey(dest):
+    stderr.writeLine "[ironwood] sendAppData dest=" & short(dest) & " no path, sending lookup"
     result = r.sendLookup(dest)
     result.addEvent(reNoRoute, "queued lookup before app data", key = some(dest))
     return
   let actions = r.sessions.writeTo(toEdPublic(dest), data)
+  stderr.writeLine "[ironwood] sendAppData dest=" & short(dest) & " sessionActions=" & $actions.len & " dataLen=" & $data.len
   for a in actions:
     case a.kind
     of oaSendToInner: r.routeSessionData(toNodeId(a.dest), a.data, result)
@@ -469,6 +483,7 @@ proc handleTraffic(r: var RouterState, tr: Traffic, step: var RouterStep) =
       of oaDeliver:
         step.deliveries.add AppDelivery(source: toNodeId(a.source), data: a.data)
         step.addEvent(reTrafficDelivered, "bytes=" & $a.data.len, key = some(toNodeId(a.source)))
+        stderr.writeLine "[ironwood] traffic delivered src=" & short(toNodeId(a.source)) & " bytes=" & $a.data.len
       of oaSendToInner:
         r.routeSessionData(toNodeId(a.dest), a.data, step)
   else:
@@ -506,7 +521,9 @@ proc handleFrame*(r: var RouterState, peerId: PeerId, frame: Frame): RouterStep 
     let a = decodeAnnounce(frame.payload)
     if a.isSome:
       let ann = fromWireAnnounce(a.get())
-      if r.updateAnnounce(ann):
+      let accepted = r.updateAnnounce(ann)
+      stderr.writeLine "[ironwood] announce key=" & short(ann.key) & " parent=" & short(ann.parent) & " seq=" & $ann.seq & " port=" & $ann.port & " accepted=" & $accepted
+      if accepted:
         r.blooms.setOnTree(remoteKey, true)
         result.addEvent(reAnnounceStored, "parent=" & short(ann.parent), some(peerId), some(ann.key))
         ## Gossip newly accepted announcements to other direct peers.
@@ -518,6 +535,7 @@ proc handleFrame*(r: var RouterState, peerId: PeerId, frame: Frame): RouterStep 
     let sr = decodeSigResFull(frame.payload)
     if sr.isSome:
       r.responses[remoteKey] = sr.get().value
+      stderr.writeLine "[ironwood] sigres from=" & short(remoteKey) & " seq=" & $sr.get().value.seq & " port=" & $sr.get().value.port
   of iwProtoBloomFilter:
     let bf = decodeBloomFilter(frame.payload)
     if bf.isSome:

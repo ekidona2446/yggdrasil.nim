@@ -1,16 +1,51 @@
 ## Main entry point for yggdrasil-nim.
+##
+## Async Chronos-based Yggdrasil mesh overlay daemon.
+## Supports TCP, TLS, SOCKS5 peer connections via the LinkManager.
+## Coordinates:
+## - LinkManager (TCP/TLS/SOCKS peer connections)
+## - PacketConn (overlay read/write + Ironwood router)
+## - TUN adapter (kernel network interface)
+## - Proxy server (SOCKS5/HTTP)
+## - Admin socket (JSON-RPC)
+## - DNS resolver
 
-import std/[os, parseopt, strutils, httpclient, net]
+import std/[os, parseopt, strutils, options, sequtils, httpclient, net]
+import chronos
 import ./config/configuration
-import ./core/[identity, tree, dht, ckr, peermanager, publicpeers, yggdebug, types]
-import ./ironwood/link
+import ./core/[identity, types, peermanager, tree, dht, ckr, publicpeers, yggdebug]
+import ./crypto/sodium
+import ./ironwood/[wire, router, routerstate, packetconn, asynclink, asyncpeer, routertypes]
 import ./admin/api
 import ./dns/localdns
 import ./transport/proxy
-import ./tun/tunadapter
+import ./tun/tun_linux
+import ./util/bytes as ubytes
 
-const Version* = "0.1.0"
+const Version* = "0.2.0"
+
 const DefaultPublicPeersUrl* = "https://publicpeers.neilalexander.dev/publicnodes.json"
+
+# ── Key management ───────────────────────────────────────────────────────────
+
+proc loadOrCreateRouterCrypto*(path: string): RouterCrypto =
+  ## Load or create Ed25519 keypair for Yggdrasil.
+  if fileExists(path):
+    for raw in readFile(path).splitLines():
+      let line = raw.strip()
+      if line.startsWith("secretKey="):
+        let bytes = ubytes.fromHex(line.split("=", 1)[1])
+        if bytes.len != 64:
+          raise newException(ValueError, "invalid Ed25519 secret key length")
+        var sk: Ed25519SecretKey
+        for i in 0 ..< 64: sk[i] = bytes[i]
+        return routerCryptoFromSodium(sk)
+    raise newException(ValueError, "key file missing secretKey= line")
+  result = newRouterCrypto()
+  writeFile(path, "# yggdrasil-nim Ed25519/libsodium key\nsecretKey=" &
+    ubytes.toHex(result.secretKey) & "\n")
+
+# ── Utility procs ────────────────────────────────────────────────────────────
 
 proc fetchText(source: string): string =
   if source.startsWith("http://") or source.startsWith("https://"):
@@ -23,11 +58,17 @@ proc tomlQuote(s: string): string =
   "\"" & s.replace("\\", "\\\\").replace("\"", "\\\"") & "\""
 
 proc canTcpConnect(peer: PeerUri, timeoutMs = 2500): bool =
-  if peer.kind notin {tkTcp, tkTls, tkWebSocket}: return false
-  let domain = if peer.host.contains(":"): AF_INET6 else: AF_INET
+  if peer.kind notin {tkTcp, tkTls, tkSocks, tkSocksTls, tkWebSocket, tkQuic}: return false
+  let host = if peer.kind in {tkSocks, tkSocksTls}:
+               peer.host.split('@')[^1].split(':')[0]
+             else: peer.host
+  let port = if peer.kind in {tkSocks, tkSocksTls}:
+               parseInt(peer.host.split('@')[^1].split(':')[1])
+             else: peer.port
+  let domain = if host.contains(":"): AF_INET6 else: AF_INET
   var sock = newSocket(domain = domain, buffered = false)
   try:
-    sock.connect(peer.host, Port(peer.port), timeout = timeoutMs)
+    sock.connect(host, Port(port), timeout = timeoutMs)
     result = true
   except CatchableError:
     result = false
@@ -87,7 +128,7 @@ proc writeGeneratedConfig(path: string, peers: seq[PublicPeer], listen: string, 
   toml.add "publicPeerLists = [" & tomlQuote(DefaultPublicPeersUrl) & "]\n\n"
   toml.add "[TUN]\n"
   toml.add "enable = " & (if tunEnable: "true" else: "false") & "\n"
-  toml.add "name = \"yggdrasil0\"\n"
+  toml.add "name = \"ygg0\"\n"
   toml.add "mtu = 65535\n\n"
   toml.add "[Proxy]\n"
   toml.add "enable = " & (if proxyEnable: "true" else: "false") & "\n"
@@ -115,39 +156,192 @@ proc writeGeneratedConfig(path: string, peers: seq[PublicPeer], listen: string, 
   toml.add "perHopProtection = false\n"
   writeFile(path, toml)
 
+# ── Data plane: TUN ↔ PacketConn ────────────────────────────────────────────
+
+proc tunToOverlay(tun: TunAdapter, pc: PacketConn) {.async.} =
+  ## Read packets from TUN, write to overlay via PacketConn.
+  ## This is the "ingress" path: kernel → overlay.
+  while tun.running:
+    try:
+      let packet = await tun.readPacket()
+      if packet.len == 0: continue
+      
+      # Parse the destination from the IP packet
+      let version = packet[0] shr 4
+      var destKey: NodeId
+      
+      if version == 6 and packet.len >= 40:
+        # IPv6: destination is in bytes [24..39]
+        # For Yggdrasil, the IPv6 address IS the NodeId (with the 200::/7 prefix)
+        # We need to convert the IPv6 address back to a NodeId
+        let destAddr: IPv6Address = cast[array[16, byte]](packet[24..39])
+        destKey = keyPrefixForYggAddress(destAddr)
+        stderr.writeLine "[dataplane] TUN→overlay dest=" & short(destKey) & " pktLen=" & $packet.len
+      elif version == 4 and packet.len >= 20:
+        # IPv4: we don't route IPv4 directly — skip for now
+        continue
+      else:
+        continue
+      
+      await pc.writeTo(destKey, packet)
+    except CancelledError:
+      break
+    except CatchableError as e:
+      if not tun.running: break
+      # Log but don't die on individual packet errors
+      await sleepAsync(chronos.milliseconds(1))
+
+proc overlayToTun(pc: PacketConn, tun: TunAdapter) {.async.} =
+  ## Read deliveries from PacketConn, write to TUN.
+  ## This is the "egress" path: overlay → kernel.
+  var buf = newSeq[byte](65536)
+  while tun.running:
+    try:
+      let (n, source) = await pc.readFrom(addr buf[0], buf.len)
+      if n == 0: continue
+      stderr.writeLine "[dataplane] overlay→TUN src=" & short(source) & " n=" & $n
+      await tun.writePacket(buf[0 ..< n])
+    except CancelledError:
+      break
+    except CatchableError as e:
+      if not tun.running: break
+      await sleepAsync(chronos.milliseconds(1))
+
+# ── Async daemon ─────────────────────────────────────────────────────────────
+
+proc runDaemon(listenAddrs, peerUris: seq[string], keyfile: string,
+               tunEnable, proxyEnable: bool,
+               proxyListen: string, dnsEnable: bool,
+               tunName: string, tunMtu: int) {.async.} =
+  var crypto: RouterCrypto
+  {.cast(gcsafe).}:
+    try:
+      crypto = loadOrCreateRouterCrypto(keyfile)
+    except Exception:
+      echo "failed to load key: ", getCurrentExceptionMsg()
+      return
+
+  let address = deriveYggAddress(crypto.publicKey)
+  let ipv6Str = toIPv6String(address)
+  echo "yggdrasil-nim ", Version, " starting..."
+  echo "publicKey=", short(crypto.publicKey)
+  echo "address=", ipv6Str
+
+  var packetConn: PacketConn
+  {.cast(gcsafe).}:
+    try:
+      packetConn = newPacketConn(crypto)
+    except Exception:
+      echo "failed to create PacketConn: ", getCurrentExceptionMsg()
+      return
+  await packetConn.start()
+
+  let linkConfig = LinkConfig(
+    listenAddrs: listenAddrs,
+    peerUris: peerUris,
+    password: @[],
+  )
+  let linkMgr = newLinkManager(crypto, packetConn, linkConfig)
+  await linkMgr.start()
+
+  # ── TUN adapter ──────────────────────────────────────────────────────────
+  var tun: TunAdapter = nil
+  if tunEnable:
+    try:
+      let tunCfg = TunConfig(
+        enable: true,
+        name: if tunName.len > 0: tunName else: "ygg0",
+        mtu: if tunMtu > 0: tunMtu else: 65535,
+        ipv6: ipv6Str,
+        ipv4: "",
+      )
+      tun = openTun(tunCfg)
+      tun.running = true
+      tun.configureInterface(ipv6Str, tunCfg.mtu)
+      tun.configureRoutes()
+      echo "TUN interface ", tun.ifName, " configured with ", ipv6Str, "/7"
+      
+      # Start data plane
+      asyncSpawn tunToOverlay(tun, packetConn)
+      asyncSpawn overlayToTun(packetConn, tun)
+      echo "Data plane active: TUN ↔ PacketConn"
+    except CatchableError as e:
+      echo "TUN setup failed: ", e.msg
+      echo "Continuing without TUN (proxy-only mode)"
+
+  # ── Proxy ────────────────────────────────────────────────────────────────
+  if proxyEnable:
+    var ps = ProxyServer(
+      cfg: ProxyConfig(enabled: true, listen: proxyListen, socks5: true, http: true),
+      running: false,
+    )
+    ps.start()
+    echo "Proxy listening at ", proxyListen
+
+  # ── DNS ──────────────────────────────────────────────────────────────────
+  if dnsEnable:
+    var dns = initLocalDnsServer(LocalDnsConfig(
+      enable: true, listen: "localhost:5053",
+      internalDomain: ".yg", hostsPath: "hosts.yg",
+      upstream: @["1.1.1.1:53", "8.8.8.8:53"],
+    ))
+    dns.start()
+    echo "DNS resolver listening at localhost:5053"
+
+  echo "Daemon running. Press Ctrl+C to exit."
+  echo "Peers: ", peerUris.len, " configured | TUN: ", if tun != nil: tun.ifName else: "disabled"
+
+  while true:
+    await sleepAsync(chronos.milliseconds(1000))
+
+# ── CLI ──────────────────────────────────────────────────────────────────────
+
 proc usage() =
   echo """
-yggdrasil-nim - Yggdrasil-style mesh overlay daemon
+yggdrasil-nim - Yggdrasil mesh overlay daemon (Chronos async)
+
+Usage:
+  yggdrasil-nim [options]
 
 Options:
-  --config=PATH        TOML config file (default: config.example.toml if present)
-  --keyfile=PATH       Override Node.keyfile
-  --proxy              Force unprivileged proxy mode
-  --socks5-addr=ADDR   Enable proxy mode and set SOCKS5/HTTP listen address
-  --no-tun             Disable TUN mode
-  --self               Print node identity and exit
-  --version            Print version and exit
+  --config=PATH           TOML config file
+  --keyfile=PATH          Override Node.keyfile
+  --listen=ADDR           Listen address (repeatable, e.g. "tcp://0.0.0.0:12345")
+  --peer=URI              Peer URI to connect to (repeatable)
+                          Supported: tcp://, tls://, ws://, wss://, quic://,
+                                     socks://, sockstls://
+                          URI params: ?key=, ?sni=, ?priority=, ?password=, ?maxbackoff=
+  --no-tun                Disable TUN mode
+  --proxy                 Enable SOCKS5/HTTP proxy
+  --socks5-addr=ADDR      Enable proxy and set SOCKS5/HTTP listen address
+  --self                  Print node identity and exit
+  --version               Print version and exit
+  --run                   Start the daemon
+
   --check-public-peers=URL_OR_FILE
-                        Fetch/read and parse official public peer JSON, then exit
-  --generate-config=PATH
-                        Generate TOML config with reachable up public peers
-  --generate-key=PATH  Generate/reuse Ed25519 Yggdrasil key file and print address
+                          Fetch/read and parse official public peer JSON, then exit
+  --generate-config=PATH  Generate TOML config with reachable up public peers
+  --generate-key=PATH     Generate/reuse Ed25519 Yggdrasil key file and print address
   --generate-proxy-config=PATH
-                        Backward-compatible alias for --generate-config + --proxy-mode
-  --proxy-mode         Generated/runtime mode: proxy only, no TUN
-  --tun-mode           Generated/runtime mode: TUN only, no proxy
-  --tun-proxy-mode     Generated/runtime mode: both TUN and proxy
-  --peer-count=N       Number of reachable up peers to put in generated config (default: 8)
-  --debug-handshake    Try Yggdrasil TCP metadata handshakes to configured/debug peers
-  --debug-ironwood     After meta, probe post-handshake Ironwood frames for tcp peers
-  --debug-peer=URI     Peer URI to test in debug handshake/probe mode (repeatable)
-  --debug-target=IPv6  Target Yggdrasil IPv6 for debug PathLookup probe
-  --handshake-count=N  Max debug handshakes/probes to attempt (default: 3)
-  --debug-keyfile=PATH Ed25519 PEM key for debug handshakes (generated if absent)
-  --add-dns=ADDR       Add DNS upstream to --config file and exit (repeatable)
-  --admin-json=JSON    Dispatch one JSON-RPC admin request and exit
-  --run                Initialize adapters and stay in daemon skeleton
-  -h, --help           Show help
+                          Backward-compatible alias for --generate-config + --proxy-mode
+  --proxy-mode            Proxy only, no TUN
+  --tun-mode              TUN only, no proxy
+  --tun-proxy-mode        Both TUN and proxy
+  --peer-count=N          Number of reachable up peers in generated config (default: 8)
+  --add-dns=ADDR          Add DNS upstream to --config file and exit (repeatable)
+  --admin-json=JSON       Dispatch one JSON-RPC admin request and exit
+  -h, --help              Show help
+
+Peer URI examples:
+  tcp://1.2.3.4:12345
+  tls://example.com:443
+  tls://1.2.3.4:443?sni=example.com
+  ws://example.com:80/path
+  wss://example.com:443/path
+  quic://example.com:443
+  socks://proxy.local:1080/1.2.3.4:12345
+  sockstls://user:pass@proxy.local:1080/example.com:443?sni=example.com
+  tcp://1.2.3.4:12345?key=abcdef1234...&priority=1&password=secret
 """
 
 proc main() =
@@ -160,22 +354,15 @@ proc main() =
   var printSelf = false
   var printVersion = false
   var adminJson = ""
-  var runLoop = false
+  var runFlag = false
   var keyOverride = ""
   var socks5Addr = ""
   var publicPeersSource = ""
   var generateConfigPath = ""
   var generateKeyPath = ""
   var peerCount = 8
-  var debugHandshake = false
-  var debugIronwood = false
-  var debugPeers: seq[string]
-  var debugTarget = ""
-  var handshakeCount = 3
-  var debugKeyFile = "yggdrasil-debug-ed25519.pem"
-  var ironwoodRun = false
-  var ironwoodSeconds = 0
-  var ironwoodKeyFile = ""
+  var listenAddrs: seq[string]
+  var peerUris: seq[string]
   var dnsToAdd: seq[string]
 
   var p = initOptParser(commandLineParams())
@@ -185,6 +372,8 @@ proc main() =
       case key
       of "config": configPath = val
       of "keyfile": keyOverride = val
+      of "listen": listenAddrs.add val
+      of "peer": peerUris.add val
       of "proxy": forceProxy = true
       of "proxy-mode":
         modeProxyOnly = true
@@ -210,23 +399,12 @@ proc main() =
         forceProxy = true
         noTun = true
       of "peer-count": peerCount = parseInt(val)
-      of "debug-handshake": debugHandshake = true
-      of "debug-ironwood":
-        debugHandshake = true
-        debugIronwood = true
-      of "debug-peer": debugPeers.add val
-      of "debug-target": debugTarget = val
-      of "handshake-count": handshakeCount = parseInt(val)
-      of "debug-keyfile": debugKeyFile = val
-      of "ironwood-run": ironwoodRun = true
-      of "ironwood-seconds": ironwoodSeconds = parseInt(val)
-      of "ironwood-keyfile": ironwoodKeyFile = val
       of "add-dns": dnsToAdd.add val
       of "admin-json": adminJson = val
-      of "run": runLoop = true
+      of "run": runFlag = true
       of "h", "help": usage(); return
       else:
-        quit "unknown option: " & key, 2
+        echo "unknown option: ", key
     of cmdArgument:
       discard
     of cmdEnd:
@@ -268,14 +446,11 @@ proc main() =
     let allPeers = parsePublicPeersJson(content, onlyUp = true)
     var selected: seq[PublicPeer]
     for p in allPeers:
-      ## The generated config prefers plain tcp:// peers because the debug
-      ## metadata handshake implemented here currently targets yggdrasil-go's
-      ## TCP link carrier. TLS/QUIC/WS carriers need their own wrappers first.
-      if p.parsed.kind != tkTcp: continue
+      if p.parsed.kind notin {tkTcp, tkTls, tkQuic, tkWebSocket}: continue
       if not canTcpConnect(p.parsed): continue
       selected.add p
       if selected.len >= peerCount: break
-    if selected.len == 0: quit "no reachable TCP/TLS/WS public peers found", 2
+    if selected.len == 0: quit "no reachable TCP/TLS public peers found", 2
     let listen = if socks5Addr.len > 0: socks5Addr else: "localhost:1080"
     let keyfile = if keyOverride.len > 0: keyOverride else: "yggdrasil.key"
     try:
@@ -297,6 +472,7 @@ proc main() =
     echo "generated ", generateConfigPath, " with ", selected.len, " reachable up public peers; tun=", tunEnable, " proxy=", proxyEnable, " proxy listen=", listen
     return
 
+  # Load config
   var cfg = loadConfig(configPath)
   if keyOverride.len > 0: cfg.node.keyfile = keyOverride
   if modeProxyOnly:
@@ -312,114 +488,54 @@ proc main() =
   if socks5Addr.len > 0: cfg.proxy.listen = socks5Addr
   if noTun: cfg.tun.enable = false
 
-  let id = loadOrCreateIdentity(cfg.node.keyfile)
-  var tr = initTree(id.publicKey)
-  var dd = initDht(id.publicKey)
-  dd.refreshSelf(tr.selfCoords, tr.revision)
-  var routes = initCkrTable()
-  var pm = initPeerManager(defaultPeerManagerConfig())
-  for uri in cfg.peers.staticPeers:
-    discard pm.addPeer(uri, psStatic, allowAutoDial = true)
-
-  if ironwoodRun:
-    var candidates = debugPeers
-    if candidates.len == 0: candidates = cfg.peers.staticPeers
-    var selected = ""
-    for uri in candidates:
-      try:
-        if parsePeerUri(uri).kind == tkTcp:
-          selected = uri
-          break
-      except CatchableError:
-        discard
-    if selected.len == 0: quit "ironwood-run: no tcp:// peer candidate found", 2
-    let iwKey = if ironwoodKeyFile.len > 0: ironwoodKeyFile else: cfg.node.keyfile
-    echo "ironwood-run starting peer=", selected, " keyfile=", iwKey,
-         " seconds=", ironwoodSeconds
-    for item in runTcpIronwoodLink(LinkRunConfig(uri: selected, keyFile: iwKey,
-                                                seconds: ironwoodSeconds, target: debugTarget,
-                                                timeoutMs: 7000)):
-      echo item.kind, " ", item.message
-    return
-
-  if debugHandshake:
-    var candidates = debugPeers
-    if candidates.len == 0: candidates = cfg.peers.staticPeers
-    var attempted = 0
-    var okCount = 0
-    for uri in candidates:
-      if attempted >= handshakeCount: break
-      var parsedOk = true
-      try:
-        if parsePeerUri(uri).kind != tkTcp: parsedOk = false
-      except CatchableError:
-        parsedOk = false
-      if not parsedOk: continue
-      inc attempted
-      if debugIronwood:
+  # Merge CLI peer URIs with config
+  if peerUris.len == 0: peerUris = cfg.peers.staticPeers
+  if listenAddrs.len == 0:
+    if cfg.admin.listen.len > 0:
+      for a in cfg.admin.listen:
         try:
-          for line in probeYggdrasilTcpIronwood(uri, debugKeyFile, seconds = 8, targetAddress = debugTarget):
-            echo uri, " ", line
-          inc okCount
-        except CatchableError as e:
-          echo "FAIL ", uri, " ironwood-probe error=", e.msg
-      else:
-        let r = performYggdrasilTcpMetadataHandshake(uri, debugKeyFile)
-        echo r.summary()
-        if r.ok: inc okCount
-    if attempted == 0:
-      quit "debug handshake: no tcp:// candidates to test", 2
-    if okCount == 0:
-      quit "debug handshake: all attempts failed", 1
-    echo "debug handshake complete: ", okCount, "/", attempted, " successful"
-    return
+          let parsed = parsePeerUri(a)
+          if parsed.kind == tkTcp:
+            listenAddrs.add a
+        except CatchableError:
+          discard
+    if listenAddrs.len == 0:
+      listenAddrs.add("tcp://0.0.0.0:12345")
 
+  # Print identity and exit
   if printSelf:
-    echo id.describe()
+    try:
+      let crypto = loadOrCreateRouterCrypto(cfg.node.keyfile)
+      echo "publicKey=", toHex(crypto.publicKey)
+      echo "address=", toIPv6String(deriveYggAddress(crypto.publicKey))
+    except CatchableError as e:
+      echo "error: ", e.msg
     return
 
-  var admin = initAdminContext(id, tr, dd, routes, pm, cfg.admin.keepalive)
+  # Admin JSON-RPC
   if adminJson.len > 0:
+    let id = loadOrCreateIdentity(cfg.node.keyfile)
+    var tr = initTree(id.publicKey)
+    var dd = initDht(id.publicKey)
+    dd.refreshSelf(tr.selfCoords, tr.revision)
+    var routes = initCkrTable()
+    var pm = initPeerManager(defaultPeerManagerConfig())
+    var admin = initAdminContext(id, tr, dd, routes, pm, cfg.admin.keepalive)
     echo admin.dispatchRpc(adminJson)
     return
 
-  var tun = initTunAdapter(TunConfig(enable: cfg.tun.enable, name: cfg.tun.name,
-                                     mtu: cfg.tun.mtu, ipv6: cfg.tun.ipv6,
-                                     ipv4: cfg.tun.ipv4))
-  var ps = ProxyServer(cfg: ProxyConfig(enabled: cfg.proxy.enable, listen: cfg.proxy.listen,
-                                        socks5: cfg.proxy.socks5, http: cfg.proxy.http),
-                       running: false)
-  var dns = initLocalDnsServer(LocalDnsConfig(enable: cfg.dns.enable, listen: cfg.dns.listen,
-                                             internalDomain: cfg.dns.internalDomain,
-                                             hostsPath: cfg.dns.hostsFile,
-                                             upstream: cfg.dns.upstream))
+  if not runFlag:
+    echo "Use --run to start the daemon."
+    return
 
-  echo "yggdrasil-nim initialized: ", id.describe()
-  echo "coordinates=", coordToString(tr.selfCoords), " root=", short(tr.rootId)
-  echo "knownPeers=", pm.knownUris().len, " tun=", cfg.tun.enable, " proxy=", cfg.proxy.enable,
-       " dns=", cfg.dns.enable
-
-  if cfg.tun.enable:
-    try:
-      tun.open()
-      echo "TUN adapter initialized for platform ", tun.platform, " (driver backend stub)"
-    except CatchableError as e:
-      echo "TUN disabled: ", e.msg
-
-  if cfg.proxy.enable:
-    ps.start()
-    echo "Proxy listening boundary initialized at ", cfg.proxy.listen
-
-  if cfg.dns.enable:
-    dns.start()
-    echo "DNS resolver boundary initialized at ", cfg.dns.listen
-
-  if runLoop:
-    echo "Daemon skeleton running. Press Ctrl+C to exit."
-    while true:
-      sleep(1000)
-  else:
-    echo "Use --run to keep the daemon skeleton running."
+  # Run async daemon
+  let proxyListen = if socks5Addr.len > 0: socks5Addr else: cfg.proxy.listen
+  waitFor runDaemon(
+    listenAddrs, peerUris, cfg.node.keyfile,
+    cfg.tun.enable, cfg.proxy.enable,
+    proxyListen, cfg.dns.enable,
+    cfg.tun.name, cfg.tun.mtu,
+  )
 
 when isMainModule:
   main()

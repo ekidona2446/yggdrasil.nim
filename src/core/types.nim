@@ -19,7 +19,7 @@ type
     ipAny, ipTcp, ipUdp, ipIcmp, ipOther
 
   TransportKind* = enum
-    tkTcp, tkTls, tkQuic, tkWebSocket, tkUnix, tkUdp
+    tkTcp, tkTls, tkQuic, tkWebSocket, tkUnix, tkUdp, tkSocks, tkSocksTls
 
   PeerUri* = object
     scheme*: string
@@ -27,6 +27,12 @@ type
     port*: int
     path*: string
     kind*: TransportKind
+    ## Query parameters
+    pinnedKeys*: seq[string]   ## ?key=hex — Ed25519 public keys to pin
+    sni*: string               ## ?sni=domain — custom TLS SNI
+    priority*: uint8           ## ?priority=N
+    password*: string          ## ?password=string
+    maxBackoff*: int           ## ?maxbackoff=seconds
 
 proc `==`*(a, b: NodeId): bool = a.bytes == b.bytes
 
@@ -172,7 +178,9 @@ proc transportKind*(scheme: string): TransportKind =
   of "ws", "wss", "websocket": tkWebSocket
   of "unix", "unixs": tkUnix
   of "udp": tkUdp
+  of "socks": tkSocks
+  of "sockstls": tkSocksTls
   else: raise newException(ValueError, "unsupported peer scheme: " & scheme)
 
 proc isStreamTransport*(k: TransportKind): bool =
-  k in {tkTcp, tkTls, tkWebSocket, tkUnix}
+  k in {tkTcp, tkTls, tkWebSocket, tkUnix, tkSocks, tkSocksTls}

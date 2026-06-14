@@ -19,17 +19,17 @@ type
 
   SodiumApi* = ref object
     lib: LibHandle
-    sodium_init: proc(): cint {.cdecl.}
-    randombytes_buf: proc(buf: pointer, size: csize_t) {.cdecl.}
-    crypto_sign_keypair: proc(pk, sk: pointer): cint {.cdecl.}
-    crypto_sign_detached: proc(sig, siglen: pointer, msg: pointer, msglen: culonglong, sk: pointer): cint {.cdecl.}
-    crypto_sign_verify_detached: proc(sig, msg: pointer, msglen: culonglong, pk: pointer): cint {.cdecl.}
-    crypto_sign_ed25519_pk_to_curve25519: proc(curvePk, edPk: pointer): cint {.cdecl.}
-    crypto_sign_ed25519_sk_to_curve25519: proc(curveSk, edSk: pointer): cint {.cdecl.}
-    crypto_box_keypair: proc(pk, sk: pointer): cint {.cdecl.}
-    crypto_box_easy: proc(ciph, msg: pointer, msglen: culonglong, nonce, pk, sk: pointer): cint {.cdecl.}
-    crypto_box_open_easy: proc(msg, ciph: pointer, ciphen: culonglong, nonce, pk, sk: pointer): cint {.cdecl.}
-    crypto_generichash: proc(outBuf: pointer, outLen: csize_t, inBuf: pointer, inLen: culonglong, key: pointer, keyLen: csize_t): cint {.cdecl.}
+    sodium_init: proc(): cint {.cdecl, gcsafe.}
+    randombytes_buf: proc(buf: pointer, size: csize_t) {.cdecl, gcsafe.}
+    crypto_sign_keypair: proc(pk, sk: pointer): cint {.cdecl, gcsafe.}
+    crypto_sign_detached: proc(sig, siglen: pointer, msg: pointer, msglen: culonglong, sk: pointer): cint {.cdecl, gcsafe.}
+    crypto_sign_verify_detached: proc(sig, msg: pointer, msglen: culonglong, pk: pointer): cint {.cdecl, gcsafe.}
+    crypto_sign_ed25519_pk_to_curve25519: proc(curvePk, edPk: pointer): cint {.cdecl, gcsafe.}
+    crypto_sign_ed25519_sk_to_curve25519: proc(curveSk, edSk: pointer): cint {.cdecl, gcsafe.}
+    crypto_box_keypair: proc(pk, sk: pointer): cint {.cdecl, gcsafe.}
+    crypto_box_easy: proc(ciph, msg: pointer, msglen: culonglong, nonce, pk, sk: pointer): cint {.cdecl, gcsafe.}
+    crypto_box_open_easy: proc(msg, ciph: pointer, ciphen: culonglong, nonce, pk, sk: pointer): cint {.cdecl, gcsafe.}
+    crypto_generichash: proc(outBuf: pointer, outLen: csize_t, inBuf: pointer, inLen: culonglong, key: pointer, keyLen: csize_t): cint {.cdecl, gcsafe.}
 
 var cached*: SodiumApi
 
@@ -81,16 +81,18 @@ proc newEd25519Keypair*(): tuple[pk: Ed25519PublicKey, sk: Ed25519SecretKey] =
     raise newException(SodiumError, "crypto_sign_keypair failed")
 
 proc signDetached*(sk: Ed25519SecretKey, msg: openArray[byte]): Signature64 =
-  let s = loadSodium()
-  var sigLen: culonglong
-  let msgPtr = if msg.len == 0: nil else: unsafeAddr msg[0]
-  if s.crypto_sign_detached(addr result[0], addr sigLen, msgPtr, culonglong(msg.len), unsafeAddr sk[0]) != 0:
-    raise newException(SodiumError, "crypto_sign_detached failed")
+  {.cast(gcsafe).}:
+    let s = loadSodium()
+    var sigLen: culonglong
+    let msgPtr = if msg.len == 0: nil else: unsafeAddr msg[0]
+    if s.crypto_sign_detached(addr result[0], addr sigLen, msgPtr, culonglong(msg.len), unsafeAddr sk[0]) != 0:
+      raise newException(SodiumError, "crypto_sign_detached failed")
 
 proc verifyDetached*(pk: Ed25519PublicKey, msg: openArray[byte], sig: Signature64): bool =
-  let s = loadSodium()
-  let msgPtr = if msg.len == 0: nil else: unsafeAddr msg[0]
-  s.crypto_sign_verify_detached(unsafeAddr sig[0], msgPtr, culonglong(msg.len), unsafeAddr pk[0]) == 0
+  {.cast(gcsafe).}:
+    let s = loadSodium()
+    let msgPtr = if msg.len == 0: nil else: unsafeAddr msg[0]
+    result = s.crypto_sign_verify_detached(unsafeAddr sig[0], msgPtr, culonglong(msg.len), unsafeAddr pk[0]) == 0
 
 proc edPublicToCurve25519*(pk: Ed25519PublicKey): Curve25519PublicKey =
   let s = loadSodium()
@@ -108,7 +110,6 @@ proc newCurve25519Keypair*(): tuple[pk: Curve25519PublicKey, sk: Curve25519Secre
     raise newException(SodiumError, "crypto_box_keypair failed")
 
 proc nonceForU64*(value: uint64): Nonce24 =
-  ## 16 zero bytes + big-endian u64, matching Ironwood/Yggdrasil-ng.
   for i in 0 ..< 8:
     result[16 + i] = byte((value shr ((7 - i) * 8)) and 0xff'u64)
 
@@ -127,7 +128,8 @@ proc boxOpen*(ciphertext: openArray[byte], nonce: Nonce24, theirPk: Curve25519Pu
     raise newException(SodiumError, "crypto_box_open_easy authentication failed")
 
 proc blake2b512*(data: openArray[byte], key: openArray[byte] = []): array[64, byte] =
-  let s = loadSodium()
+  {.cast(gcsafe).}:
+    let s = loadSodium()
   let dataPtr = if data.len == 0: nil else: unsafeAddr data[0]
   let keyPtr = if key.len == 0: nil else: unsafeAddr key[0]
   if s.crypto_generichash(addr result[0], csize_t(64), dataPtr, culonglong(data.len), keyPtr, csize_t(key.len)) != 0:

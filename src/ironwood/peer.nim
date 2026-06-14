@@ -52,7 +52,7 @@ type
 proc initIronwoodPeer*(id: PeerId, remoteKey: NodeId, crypto: RouterCrypto,
                        localPort: PeerPort = 1): IronwoodPeer =
   IronwoodPeer(id: id, remoteKey: remoteKey, remotePort: 0, localPort: localPort,
-               crypto: crypto, rtt: initRttTracker(), nextSigReqSeq: 1,
+               crypto: crypto, rtt: initRttTracker(), nextSigReqSeq: 0,
                announces: initTable[NodeId, RouterAnnounce]())
 
 proc addEvent(step: var PeerStep, kind: PeerEventKind, detail = "") =
@@ -60,9 +60,9 @@ proc addEvent(step: var PeerStep, kind: PeerEventKind, detail = "") =
 
 proc makeKeepAlive*(): seq[byte] = encodeFrame(iwKeepAlive, [])
 
-proc makeSigReq*(p: var IronwoodPeer, nonce: uint64): seq[byte] =
-  let seq = p.nextSigReqSeq
-  inc p.nextSigReqSeq
+proc makeSigReq*(p: var IronwoodPeer, seq: uint64, nonce: uint64): seq[byte] =
+  ## Create a SigReq frame with the given seq and nonce.
+  ## The seq MUST be announces[selfKey].seq + 1 to be compatible with Go ironwood.
   p.lastSigReqSeq = seq
   p.lastSigReqNonce = nonce
   p.rtt.markSigReqSent(p.id)

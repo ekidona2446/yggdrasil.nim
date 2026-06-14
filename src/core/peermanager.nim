@@ -54,24 +54,90 @@ proc parsePeerUri*(uri: string): PeerUri =
     result.host = ""
     result.port = 0
     return
-  if rest.startsWith("["):
-    let close = rest.find(']')
+  # Separate query string
+  var hostPortAndPath = rest
+  var queryString = ""
+  let qPos = rest.find('?')
+  if qPos >= 0:
+    hostPortAndPath = rest[0 ..< qPos]
+    queryString = rest[qPos + 1 .. ^1]
+  # SOCKS URLs: socks://[user:pass@]proxyhost:proxyport/desthost:destport
+  if result.kind in {tkSocks, tkSocksTls}:
+    let slash = hostPortAndPath.find('/')
+    if slash >= 0:
+      let proxyPart = hostPortAndPath[0 ..< slash]
+      let destPart = hostPortAndPath[slash + 1 .. ^1]
+      result.host = proxyPart
+      result.path = destPart
+      let colon = proxyPart.rfind(':')
+      if colon >= 0:
+        # Strip userinfo if present
+        var addrPart = proxyPart
+        let atPos = proxyPart.find('@')
+        if atPos >= 0: addrPart = proxyPart[atPos + 1 .. ^1]
+        let c2 = addrPart.rfind(':')
+        if c2 >= 0: result.port = parseInt(addrPart[c2 + 1 .. ^1])
+    else:
+      result.host = hostPortAndPath
+    # Parse query params for SOCKS too
+    if queryString.len > 0:
+      for kv in queryString.split('&'):
+        let eq = kv.find('=')
+        if eq < 0: continue
+        let key = kv[0 ..< eq]
+        let val = kv[eq + 1 .. ^1]
+        case key.toLowerAscii()
+        of "key": result.pinnedKeys.add(val)
+        of "sni": result.sni = val
+        of "priority":
+          try: result.priority = uint8(parseInt(val))
+          except ValueError: discard
+        of "password": result.password = val
+        of "maxbackoff":
+          try: result.maxBackoff = parseInt(val)
+          except ValueError: discard
+        else: discard
+    return
+  if hostPortAndPath.startsWith("["):
+    let close = hostPortAndPath.find(']')
     if close < 0: raise newException(ValueError, "invalid bracketed IPv6 peer URI")
-    result.host = rest[1 ..< close]
-    if close + 1 < rest.len and rest[close + 1] == ':':
-      result.port = parseInt(rest[close + 2 .. ^1])
+    result.host = hostPortAndPath[1 ..< close]
+    if close + 1 < hostPortAndPath.len and hostPortAndPath[close + 1] == ':':
+      result.port = parseInt(hostPortAndPath[close + 2 .. ^1])
     else:
       raise newException(ValueError, "peer URI missing port: " & uri)
   else:
-    let colon = rest.rfind(':')
+    let colon = hostPortAndPath.rfind(':')
     if colon < 0: raise newException(ValueError, "peer URI missing port: " & uri)
-    result.host = rest[0 ..< colon]
-    result.port = parseInt(rest[colon + 1 .. ^1])
+    result.host = hostPortAndPath[0 ..< colon]
+    result.port = parseInt(hostPortAndPath[colon + 1 .. ^1])
   if result.host.len == 0: raise newException(ValueError, "peer URI host is empty")
   if result.port <= 0 or result.port > 65535: raise newException(ValueError, "peer URI port out of range")
+  # Parse query parameters
+  if queryString.len > 0:
+    for kv in queryString.split('&'):
+      let eq = kv.find('=')
+      if eq < 0: continue
+      let key = kv[0 ..< eq]
+      let val = kv[eq + 1 .. ^1]
+      case key.toLowerAscii()
+      of "key": result.pinnedKeys.add(val)
+      of "sni": result.sni = val
+      of "priority":
+        try: result.priority = uint8(parseInt(val))
+        except ValueError: discard
+      of "password": result.password = val
+      of "maxbackoff":
+        try: result.maxBackoff = parseInt(val)
+        except ValueError: discard
+      else: discard
 
 proc `$`*(u: PeerUri): string =
   if u.kind == tkUnix: u.scheme & "://" & u.path
+  elif u.kind in {tkSocks, tkSocksTls}: u.scheme & "://" & u.host & "/" & u.path
+  elif u.kind in {tkWebSocket} and u.path.len > 0:
+    if u.host.contains(':'): u.scheme & "://[" & u.host & "]:" & $u.port & u.path
+    else: u.scheme & "://" & u.host & ":" & $u.port & u.path
   elif u.host.contains(':'): u.scheme & "://[" & u.host & "]:" & $u.port
   else: u.scheme & "://" & u.host & ":" & $u.port
 

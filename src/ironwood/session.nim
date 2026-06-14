@@ -310,10 +310,11 @@ proc handleData*(m: var SessionManager, fromKey: Ed25519PublicKey, data: openArr
     var made = m.createSessionFromInit(fromKey, init.get().init)
     var info = made.info
     let ack = SessionInit(current: info.sendPub, next: info.nextPub, keySeq: info.localKeySeq, seq: unixSeq())
+    m.sessions[fromKey] = info
+    # IMPORTANT: Send Ack BEFORE buffered data, so peer can set up session first
+    result.add OutAction(kind: oaSendToInner, dest: fromKey, data: ack.encrypt(m.local, fromKey, SessionTypeAck))
     if made.buffer.isSome:
       result.add OutAction(kind: oaSendToInner, dest: fromKey, data: info.doSend(made.buffer.get()))
-    m.sessions[fromKey] = info
-    result.add OutAction(kind: oaSendToInner, dest: fromKey, data: ack.encrypt(m.local, fromKey, SessionTypeAck))
   of SessionTypeAck:
     let ack = decryptSessionInit(data, m.localCurveSk, fromKey)
     if ack.isNone: return @[]
@@ -324,9 +325,10 @@ proc handleData*(m: var SessionManager, fromKey: Ed25519PublicKey, data: openArr
     else:
       var made = m.createSessionFromInit(fromKey, ack.get().init)
       if ack.get().init.seq > made.info.seq: made.info.handleUpdate(ack.get().init)
+      m.sessions[fromKey] = made.info
+      # Send buffered data if any (but do NOT send another Ack back!)
       if made.buffer.isSome:
         result.add OutAction(kind: oaSendToInner, dest: fromKey, data: made.info.doSend(made.buffer.get()))
-      m.sessions[fromKey] = made.info
   of SessionTypeTraffic:
     if not m.sessions.hasKey(fromKey): return @[]
     var info = m.sessions[fromKey]

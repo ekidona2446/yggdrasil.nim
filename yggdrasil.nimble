@@ -3,7 +3,7 @@
 version       = "0.0.1"
 author        = "nierneon"
 description   = "A Nim reimplementation scaffold of the Yggdrasil mesh network architecture"
-license       = "Apache-2.0"
+license       = "AGPL v3"
 srcDir        = "src"
 bin           = @["yggdrasil"]
 

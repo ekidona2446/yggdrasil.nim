@@ -1,0 +1,204 @@
+## Async Chronos-based PacketConn for Yggdrasil.
+##
+## Central overlay abstraction:
+## - Application data enters/exits through readFrom/writeTo
+## - Peer connections registered via handleConn
+## - Background router actor processes frames and runs maintenance
+
+import std/[tables, options, monotimes, times]
+import chronos
+import ../core/types
+import ./wire
+import ./router
+import ./routerstate
+import ./bloom
+import ./session
+import ./asyncpeer
+import ./routertypes
+
+const
+  RecvChannelSize* = 512
+  RouterChannelSize* = 4096
+  MaintenanceIntervalMs* = 1000
+  RouterRefreshSeconds* = 240
+  RouterTimeoutSeconds* = 480
+
+type
+  PacketConn* = ref object
+    crypto*: RouterCrypto
+    state*: RouterState
+    deliveryQueue*: AsyncQueue[AppDelivery]
+    peers*: Table[PeerId, AsyncPeer]
+    peerByKey*: Table[NodeId, PeerId]
+    routerChan*: AsyncQueue[RouterMessage]
+    maintenanceFut*: Future[void]
+    running*: bool
+
+proc newPacketConn*(crypto: RouterCrypto): PacketConn =
+  result = PacketConn(
+    crypto: crypto,
+    state: initRouterState(crypto),
+    deliveryQueue: newAsyncQueue[AppDelivery](RecvChannelSize),
+    routerChan: newAsyncQueue[RouterMessage](RouterChannelSize),
+    running: false,
+  )
+
+proc mtu*(pc: PacketConn): uint64 =
+  min(65535'u64 * 2 - 1, 65535'u64)
+
+proc localAddr*(pc: PacketConn): NodeId =
+  pc.crypto.publicKey
+
+proc dispatchOutbound(pc: PacketConn, step: RouterStep) =
+  for action in step.outbound:
+    if pc.peers.hasKey(action.peerId):
+      pc.peers[action.peerId].sendFrame(action.frame)
+
+proc dispatchDeliveries(pc: PacketConn, step: RouterStep) =
+  for d in step.deliveries:
+    # All deliveries are already decrypted by handleTraffic/sendAppData
+    # No need to check for session type — data is plain app-level payload
+    try:
+      pc.deliveryQueue.addLastNoWait(d)
+    except AsyncQueueFullError:
+      discard
+
+proc processRouterMessage(pc: PacketConn, msg: RouterMessage) =
+  {.cast(gcsafe).}:
+    try:
+      case msg.kind
+      of rmAddPeer:
+        if not pc.state.peerByKey.hasKey(msg.peerKey):
+          let step = pc.state.addPeer(msg.peerKey, msg.priority)
+          pc.dispatchOutbound(step)
+          pc.dispatchDeliveries(step)
+      of rmRemovePeer:
+        if pc.state.peers.hasKey(msg.peerId):
+          pc.state.peers.del(msg.peerId)
+        if pc.state.peerByKey.hasKey(msg.peerKey) and
+           pc.state.peerByKey[msg.peerKey] == msg.peerId:
+          pc.state.peerByKey.del(msg.peerKey)
+        pc.state.sentAnnounces.del(msg.peerId)
+        pc.state.blooms.removePeer(msg.peerKey)
+      of rmHandleFrame:
+        if pc.state.peers.hasKey(msg.peerId):
+          let step = pc.state.handleFrame(msg.peerId, msg.frame)
+          pc.dispatchOutbound(step)
+          pc.dispatchDeliveries(step)
+      of rmSendTraffic:
+        let step = pc.state.sendAppData(msg.traffic.dest, msg.traffic.payload)
+        pc.dispatchOutbound(step)
+        pc.dispatchDeliveries(step)
+      of rmMaintenanceTick:
+        let step = pc.state.maintenance()
+        pc.dispatchOutbound(step)
+        pc.dispatchDeliveries(step)
+      of rmForceRefresh:
+        pc.state.refresh = true
+        pc.state.doRoot1 = true
+        pc.state.doRoot2 = true
+        pc.state.lastRefresh = getTime() - initDuration(seconds = RouterRefreshSeconds)
+    except CatchableError:
+      discard
+
+proc routerActorLoop(pc: PacketConn) {.async.} =
+  var lastTick = getMonoTime()
+  while pc.running:
+    let now = getMonoTime()
+    let elapsed = int((now - lastTick).inMilliseconds)
+    let waitMs = max(1, MaintenanceIntervalMs - elapsed)
+    
+    let sleepFut = sleepAsync(chronos.milliseconds(waitMs))
+    let recvFut = pc.routerChan.popFirst()
+    let completed = await race(recvFut, sleepFut)
+    
+    {.cast(gcsafe).}:
+      if completed == recvFut:
+        try:
+          let msg = recvFut.read()
+          try:
+            pc.processRouterMessage(msg)
+          except Exception:
+            discard
+        except CatchableError:
+          discard
+      else:
+        try:
+          pc.processRouterMessage(RouterMessage(kind: rmMaintenanceTick))
+        except Exception:
+          discard
+        lastTick = getMonoTime()
+
+proc readFrom*(pc: PacketConn, buf: ptr byte, bufLen: int): Future[(int, NodeId)] {.async.} =
+  let delivery = await pc.deliveryQueue.popFirst()
+  let n = min(bufLen, delivery.data.len)
+  if n > 0:
+    copyMem(buf, unsafeAddr delivery.data[0], n)
+  result = (n, delivery.source)
+
+proc writeTo*(pc: PacketConn, dest: NodeId, data: seq[byte]): Future[void] {.async.} = 
+  let msg = RouterMessage(
+    kind: rmSendTraffic,
+    traffic: Traffic(
+      path: @[], fromPath: @[],
+      source: pc.crypto.publicKey, dest: dest,
+      watermark: high(uint64), payload: data,
+    )
+  )
+  try:
+    pc.routerChan.addLastNoWait(msg)
+  except AsyncQueueFullError:
+    await pc.routerChan.addLast(msg)
+
+proc handleConn*(pc: PacketConn, peerKey: NodeId, transport: StreamTransport,
+                 priority: uint8 = 0): Future[void] {.async.} =
+  ## Handle a new or re-connected peer.
+  ## Always sends rmAddPeer to ensure the router state is consistent.
+  
+  # Always register the peer with the router (handles reconnection gracefully)
+  let addMsg = RouterMessage(kind: rmAddPeer, peerKey: peerKey, priority: priority)
+  await pc.routerChan.addLast(addMsg)
+  
+  var pid: PeerId = 0
+  for attempt in 0 ..< 100:
+    let pidOpt = pc.state.peerIdFor(peerKey)
+    if pidOpt.isSome:
+      pid = pidOpt.get()
+      break
+    await sleepAsync(chronos.milliseconds(20))
+  
+  if pid == 0:
+    raise newException(ValueError, "peer not registered after addPeer")
+  
+  # If there's an existing peer connection for this PeerId, close it first
+  if pc.peers.hasKey(pid):
+    let oldPeer = pc.peers[pid]
+    oldPeer.close()
+    pc.peers.del(pid)
+  
+  let peer = newAsyncPeer(pid, peerKey, transport, pc.routerChan)
+  pc.peers[pid] = peer
+  pc.peerByKey[peerKey] = pid
+  
+  try:
+    await peer.run()
+  finally:
+    pc.peers.del(pid)
+    if pc.peerByKey.hasKey(peerKey) and pc.peerByKey[peerKey] == pid:
+      pc.peerByKey.del(peerKey)
+    let rmMsg = RouterMessage(kind: rmRemovePeer, peerId: pid, peerKey: peerKey)
+    try:
+      pc.routerChan.addLastNoWait(rmMsg)
+    except AsyncQueueFullError:
+      asyncSpawn pc.routerChan.addLast(rmMsg)
+
+proc start*(pc: PacketConn) {.async.} =
+  pc.running = true
+  pc.maintenanceFut = routerActorLoop(pc)
+
+proc close*(pc: PacketConn) {.async.} =
+  pc.running = false
+  for pid, peer in pc.peers:
+    peer.close()
+  pc.peers.clear()
+  pc.peerByKey.clear()
