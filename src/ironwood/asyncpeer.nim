@@ -135,7 +135,8 @@ proc readerLoop(peer: AsyncPeer) {.async.} =
         asyncSpawn peer.routerChan.addLast(msg)
     except CancelledError:
       break
-    except CatchableError:
+    except CatchableError as e:
+      stderr.writeLine "[asyncpeer] reader error peer=" & short(peer.remoteKey) & ": " & e.msg
       break
 
 proc writerLoop(peer: AsyncPeer) {.async.} =
@@ -150,7 +151,8 @@ proc writerLoop(peer: AsyncPeer) {.async.} =
       let frameData = recvFut.read()
       try:
         await peer.writer.write(frameData)
-      except CatchableError:
+      except CatchableError as e:
+        stderr.writeLine "[asyncpeer] writer error peer=" & short(peer.remoteKey) & ": " & e.msg
         break
     else:
       try:

@@ -12,7 +12,7 @@ suite "ironwood peer state machine":
       let cb = newRouterCrypto()
       var a = initIronwoodPeer(1, cb.publicKey, ca, localPort = 7)
       var b = initIronwoodPeer(2, ca.publicKey, cb, localPort = 9)
-      let reqFrame = a.makeSigReq(12345)
+      let reqFrame = a.makeSigReq(12345'u64, 0'u64)
       let bStep = b.handleFrameBytes(reqFrame)
       check bStep.events.len >= 1
       check bStep.events[0].kind == peSigReqReceived

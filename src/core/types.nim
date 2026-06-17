@@ -170,6 +170,47 @@ proc deriveULA*(id: NodeId): IPv6Address =
   ## Yggdrasil 200::/7 address, not a ULA.
   deriveYggAddress(id)
 
+# ── Subnet / Bloom-transform derivation ──────────────────────────────────────
+#
+# Go's Ironwood uses WithBloomTransform(SubnetForKey(key).GetKey()).  This
+# converts a full 32-byte Ed25519 public key into a coarse partial key derived
+# from its /64 Yggdrasil subnet, so that bloom-filter lookups performed with an
+# address-derived partial key match bloom entries populated with full keys.
+
+type YggSubnet* = array[8, byte]
+
+proc deriveYggSubnet*(id: NodeId): YggSubnet =
+  ## Yggdrasil-compatible address.SubnetForKey derivation.
+  ## Same as AddrForKey but truncated to 8 bytes and with the subnet bit set.
+  let yggAddr = deriveYggAddress(id)
+  for i in 0 ..< 8: result[i] = yggAddr[i]
+  result[0] = result[0] or 0x01'u8  # mark as subnet (prefix 0x02 | 0x01 = 0x03)
+
+proc subnetGetKey*(snet: YggSubnet): NodeId =
+  ## Yggdrasil-compatible Subnet.GetKey derivation.
+  ## Mirrors Address.GetKey but operates on the 8-byte subnet, recovering only
+  ## the ~56 bits encoded in a /64 prefix.  Unknown bits end up as 0xFF after
+  ## inversion, matching Go's behaviour.
+  let ones = int(snet[1])
+  for idx in 0 ..< ones:
+    result.bytes[idx div 8] = result.bytes[idx div 8] or (0x80'u8 shr (idx mod 8))
+  let keyOffset = ones + 1
+  let addrOffset = 16  # 8 * len(prefix) + 8 = 8*1 + 8
+  for idx in addrOffset ..< 8 * 8:  # 8 * len(subnet) = 64
+    var bits = snet[idx div 8] and (0x80'u8 shr (idx mod 8))
+    bits = bits shl (idx mod 8)
+    let keyIdx = keyOffset + (idx - addrOffset)
+    bits = bits shr (keyIdx mod 8)
+    let keyByte = keyIdx div 8
+    if keyByte >= 32: break
+    result.bytes[keyByte] = result.bytes[keyByte] or bits
+  for i in 0 ..< 32: result.bytes[i] = not result.bytes[i]
+
+proc bloomTransform*(key: NodeId): NodeId =
+  ## Transform applied to keys before bloom-filter operations.
+  ## Equivalent to Go's WithBloomTransform(SubnetForKey(key).GetKey()).
+  subnetGetKey(deriveYggSubnet(key))
+
 proc transportKind*(scheme: string): TransportKind =
   case scheme.toLowerAscii()
   of "tcp": tkTcp

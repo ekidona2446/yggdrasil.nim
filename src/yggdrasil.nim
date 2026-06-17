@@ -19,7 +19,7 @@ import ./ironwood/[wire, router, routerstate, packetconn, asynclink, asyncpeer, 
 import ./admin/api
 import ./dns/localdns
 import ./transport/proxy
-import ./tun/tun_linux
+import ./tun/tunadapter
 import ./util/bytes as ubytes
 
 const Version* = "0.2.0"
@@ -171,19 +171,25 @@ proc tunToOverlay(tun: TunAdapter, pc: PacketConn) {.async.} =
       var destKey: NodeId
       
       if version == 6 and packet.len >= 40:
-        # IPv6: destination is in bytes [24..39]
-        # For Yggdrasil, the IPv6 address IS the NodeId (with the 200::/7 prefix)
-        # We need to convert the IPv6 address back to a NodeId
-        let destAddr: IPv6Address = cast[array[16, byte]](packet[24..39])
+        # IPv6: destination is in bytes [24..39].
+        # For Yggdrasil, the 200::/7 IPv6 address encodes a prefix of the NodeId.
+        var destAddr: IPv6Address
+        for i in 0 ..< 16: destAddr[i] = packet[24 + i]
         destKey = keyPrefixForYggAddress(destAddr)
-        stderr.writeLine "[dataplane] TUN→overlay dest=" & short(destKey) & " pktLen=" & $packet.len
+        stderr.writeLine "[dataplane] TUN->overlay dest=" & short(destKey) & " pktLen=" & $packet.len
       elif version == 4 and packet.len >= 20:
-        # IPv4: we don't route IPv4 directly — skip for now
+        # IPv4: we don't route IPv4 directly - skip for now
         continue
       else:
         continue
       
-      await pc.writeTo(destKey, packet)
+      # Prepend typeSessionTraffic byte (0x01) to match Go yggdrasil's
+      # core.WriteTo which wraps every TUN packet with this type marker.
+      # Go: typeSessionDummy=0, typeSessionTraffic=1, typeSessionProto=2
+      var framed = newSeq[byte](packet.len + 1)
+      framed[0] = 0x01'u8  # typeSessionTraffic
+      for i in 0 ..< packet.len: framed[1 + i] = packet[i]
+      await pc.writeTo(destKey, framed)
     except CancelledError:
       break
     except CatchableError as e:
@@ -193,14 +199,20 @@ proc tunToOverlay(tun: TunAdapter, pc: PacketConn) {.async.} =
 
 proc overlayToTun(pc: PacketConn, tun: TunAdapter) {.async.} =
   ## Read deliveries from PacketConn, write to TUN.
-  ## This is the "egress" path: overlay → kernel.
+  ## This is the "egress" path: overlay -> kernel.
   var buf = newSeq[byte](65536)
   while tun.running:
     try:
       let (n, source) = await pc.readFrom(addr buf[0], buf.len)
       if n == 0: continue
-      stderr.writeLine "[dataplane] overlay→TUN src=" & short(source) & " n=" & $n
-      await tun.writePacket(buf[0 ..< n])
+      # Strip the typeSessionTraffic byte (0x01) that Go yggdrasil prepends.
+      var offset = 0
+      if n > 0 and buf[0] == 0x01'u8:
+        offset = 1
+      let pktLen = n - offset
+      if pktLen <= 0: continue
+      stderr.writeLine "[dataplane] overlay->TUN src=" & short(source) & " n=" & $pktLen
+      await tun.writePacket(buf[offset ..< n])
     except CancelledError:
       break
     except CatchableError as e:
@@ -256,9 +268,9 @@ proc runDaemon(listenAddrs, peerUris: seq[string], keyfile: string,
         ipv4: "",
       )
       tun = openTun(tunCfg)
-      tun.running = true
       tun.configureInterface(ipv6Str, tunCfg.mtu)
       tun.configureRoutes()
+      tun.startIo()
       echo "TUN interface ", tun.ifName, " configured with ", ipv6Str, "/7"
       
       # Start data plane
@@ -364,6 +376,7 @@ proc main() =
   var listenAddrs: seq[string]
   var peerUris: seq[string]
   var dnsToAdd: seq[string]
+  var tunNameOverride = ""
 
   var p = initOptParser(commandLineParams())
   for kind, key, val in p.getopt():
@@ -371,6 +384,7 @@ proc main() =
     of cmdLongOption, cmdShortOption:
       case key
       of "config": configPath = val
+      of "tun-name": tunNameOverride = val
       of "keyfile": keyOverride = val
       of "listen": listenAddrs.add val
       of "peer": peerUris.add val
@@ -530,11 +544,12 @@ proc main() =
 
   # Run async daemon
   let proxyListen = if socks5Addr.len > 0: socks5Addr else: cfg.proxy.listen
+  let tunName = if tunNameOverride.len > 0: tunNameOverride else: cfg.tun.name
   waitFor runDaemon(
     listenAddrs, peerUris, cfg.node.keyfile,
     cfg.tun.enable, cfg.proxy.enable,
     proxyListen, cfg.dns.enable,
-    cfg.tun.name, cfg.tun.mtu,
+    tunName, cfg.tun.mtu,
   )
 
 when isMainModule:

@@ -29,6 +29,9 @@ type
     crypto_box_keypair: proc(pk, sk: pointer): cint {.cdecl, gcsafe.}
     crypto_box_easy: proc(ciph, msg: pointer, msglen: culonglong, nonce, pk, sk: pointer): cint {.cdecl, gcsafe.}
     crypto_box_open_easy: proc(msg, ciph: pointer, ciphen: culonglong, nonce, pk, sk: pointer): cint {.cdecl, gcsafe.}
+    crypto_box_beforenm: proc(k, pk, sk: pointer): cint {.cdecl, gcsafe.}
+    crypto_box_easy_afternm: proc(ciph, msg: pointer, msglen: culonglong, nonce, k: pointer): cint {.cdecl, gcsafe.}
+    crypto_box_open_easy_afternm: proc(msg, ciph: pointer, ciphen: culonglong, nonce, k: pointer): cint {.cdecl, gcsafe.}
     crypto_generichash: proc(outBuf: pointer, outLen: csize_t, inBuf: pointer, inLen: culonglong, key: pointer, keyLen: csize_t): cint {.cdecl, gcsafe.}
 
 var cached*: SodiumApi
@@ -57,6 +60,9 @@ proc loadSodium*(): SodiumApi =
   result.crypto_box_keypair = loadSym[typeof(result.crypto_box_keypair)](lib, "crypto_box_keypair")
   result.crypto_box_easy = loadSym[typeof(result.crypto_box_easy)](lib, "crypto_box_easy")
   result.crypto_box_open_easy = loadSym[typeof(result.crypto_box_open_easy)](lib, "crypto_box_open_easy")
+  result.crypto_box_beforenm = loadSym[typeof(result.crypto_box_beforenm)](lib, "crypto_box_beforenm")
+  result.crypto_box_easy_afternm = loadSym[typeof(result.crypto_box_easy_afternm)](lib, "crypto_box_easy_afternm")
+  result.crypto_box_open_easy_afternm = loadSym[typeof(result.crypto_box_open_easy_afternm)](lib, "crypto_box_open_easy_afternm")
   result.crypto_generichash = loadSym[typeof(result.crypto_generichash)](lib, "crypto_generichash")
   if result.sodium_init() < 0:
     raise newException(SodiumError, "sodium_init failed")
@@ -126,6 +132,28 @@ proc boxOpen*(ciphertext: openArray[byte], nonce: Nonce24, theirPk: Curve25519Pu
   result = newSeq[byte](ciphertext.len - 16)
   if s.crypto_box_open_easy(addr result[0], unsafeAddr ciphertext[0], culonglong(ciphertext.len), unsafeAddr nonce[0], unsafeAddr theirPk[0], unsafeAddr ourSk[0]) != 0:
     raise newException(SodiumError, "crypto_box_open_easy authentication failed")
+
+proc precompute*(theirPk: Curve25519PublicKey, ourSk: Curve25519SecretKey): array[32, byte] =
+  ## Compute a shared key (like Go's box.Precompute).
+  let s = loadSodium()
+  if s.crypto_box_beforenm(addr result[0], unsafeAddr theirPk[0], unsafeAddr ourSk[0]) != 0:
+    raise newException(SodiumError, "crypto_box_beforenm failed")
+
+proc boxSealAfterPrecompute*(msg: openArray[byte], nonce: Nonce24, shared: array[32, byte]): seq[byte] =
+  ## Seal a message using a precomputed shared key (like Go's box.SealAfterPrecomputation).
+  let s = loadSodium()
+  result = newSeq[byte](msg.len + 16)
+  let msgPtr = if msg.len == 0: nil else: unsafeAddr msg[0]
+  if s.crypto_box_easy_afternm(addr result[0], msgPtr, culonglong(msg.len), unsafeAddr nonce[0], unsafeAddr shared[0]) != 0:
+    raise newException(SodiumError, "crypto_box_easy_afternm failed")
+
+proc boxOpenAfterPrecompute*(ciphertext: openArray[byte], nonce: Nonce24, shared: array[32, byte]): seq[byte] =
+  ## Open a message using a precomputed shared key (like Go's box.OpenAfterPrecomputation).
+  if ciphertext.len < 16: raise newException(SodiumError, "ciphertext too short")
+  let s = loadSodium()
+  result = newSeq[byte](ciphertext.len - 16)
+  if s.crypto_box_open_easy_afternm(addr result[0], unsafeAddr ciphertext[0], culonglong(ciphertext.len), unsafeAddr nonce[0], unsafeAddr shared[0]) != 0:
+    raise newException(SodiumError, "crypto_box_open_easy_afternm authentication failed")
 
 proc blake2b512*(data: openArray[byte], key: openArray[byte] = []): array[64, byte] =
   {.cast(gcsafe).}:

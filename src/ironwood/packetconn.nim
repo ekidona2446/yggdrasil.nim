@@ -24,6 +24,8 @@ const
   RouterTimeoutSeconds* = 480
 
 type
+  PathNotifyCb* = proc(key: NodeId) {.gcsafe, raises: [].}
+
   PacketConn* = ref object
     crypto*: RouterCrypto
     state*: RouterState
@@ -33,6 +35,7 @@ type
     routerChan*: AsyncQueue[RouterMessage]
     maintenanceFut*: Future[void]
     running*: bool
+    pathNotifyCb*: PathNotifyCb
 
 proc newPacketConn*(crypto: RouterCrypto): PacketConn =
   result = PacketConn(
@@ -56,12 +59,16 @@ proc dispatchOutbound(pc: PacketConn, step: RouterStep) =
 
 proc dispatchDeliveries(pc: PacketConn, step: RouterStep) =
   for d in step.deliveries:
-    # All deliveries are already decrypted by handleTraffic/sendAppData
-    # No need to check for session type — data is plain app-level payload
     try:
       pc.deliveryQueue.addLastNoWait(d)
     except AsyncQueueFullError:
       discard
+
+proc dispatchEvents(pc: PacketConn, step: RouterStep) =
+  for ev in step.events:
+    if ev.kind == rePathNotifyAccepted and ev.key.isSome and pc.pathNotifyCb != nil:
+      try: pc.pathNotifyCb(ev.key.get())
+      except CatchableError: discard
 
 proc processRouterMessage(pc: PacketConn, msg: RouterMessage) =
   {.cast(gcsafe).}:
@@ -85,6 +92,7 @@ proc processRouterMessage(pc: PacketConn, msg: RouterMessage) =
           let step = pc.state.handleFrame(msg.peerId, msg.frame)
           pc.dispatchOutbound(step)
           pc.dispatchDeliveries(step)
+          pc.dispatchEvents(step)
       of rmSendTraffic:
         let step = pc.state.sendAppData(msg.traffic.dest, msg.traffic.payload)
         pc.dispatchOutbound(step)
@@ -153,9 +161,9 @@ proc writeTo*(pc: PacketConn, dest: NodeId, data: seq[byte]): Future[void] {.asy
 proc handleConn*(pc: PacketConn, peerKey: NodeId, transport: StreamTransport,
                  priority: uint8 = 0): Future[void] {.async.} =
   ## Handle a new or re-connected peer.
-  ## Always sends rmAddPeer to ensure the router state is consistent.
-  
-  # Always register the peer with the router (handles reconnection gracefully)
+  ## Sends rmAddPeer via the router channel, polls until the peer is registered,
+  ## then starts the frame loop. The router actor dispatches outbound frames
+  ## during maintenance ticks.
   let addMsg = RouterMessage(kind: rmAddPeer, peerKey: peerKey, priority: priority)
   await pc.routerChan.addLast(addMsg)
   
@@ -170,7 +178,6 @@ proc handleConn*(pc: PacketConn, peerKey: NodeId, transport: StreamTransport,
   if pid == 0:
     raise newException(ValueError, "peer not registered after addPeer")
   
-  # If there's an existing peer connection for this PeerId, close it first
   if pc.peers.hasKey(pid):
     let oldPeer = pc.peers[pid]
     oldPeer.close()

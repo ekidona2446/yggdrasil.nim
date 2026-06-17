@@ -10,9 +10,7 @@ import ../util/ipnet
 
 when defined(linux):
   import ./tun_linux
-  from ./tun_linux import TunAdapter, TunConfig, openTun, configureInterface,
-                            configureRoutes, readPacket, writePacket, close,
-                            detectInnerProtocol, tpLinux, TunPlatform
+  export tun_linux
   
   proc currentPlatform*(): TunPlatform = tpLinux
   

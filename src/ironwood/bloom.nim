@@ -117,7 +117,7 @@ proc add*(bf: var BloomFilter, key: openArray[byte]) =
   let h = baseHashes(key)
   for i in 0 ..< BloomK: bf.setBit(location(h, i, BloomBits))
 
-proc add*(bf: var BloomFilter, key: NodeId) = bf.add(key.bytes)
+proc add*(bf: var BloomFilter, key: NodeId) = bf.add(bloomTransform(key).bytes)
 
 proc test*(bf: BloomFilter, key: openArray[byte]): bool =
   let h = baseHashes(key)
@@ -125,7 +125,7 @@ proc test*(bf: BloomFilter, key: openArray[byte]): bool =
     if not bf.getBit(location(h, i, BloomBits)): return false
   true
 
-proc test*(bf: BloomFilter, key: NodeId): bool = bf.test(key.bytes)
+proc test*(bf: BloomFilter, key: NodeId): bool = bf.test(bloomTransform(key).bytes)
 
 proc merge*(bf: var BloomFilter, other: BloomFilter) =
   for i in 0 ..< BloomU64s: bf.bits[i] = bf.bits[i] or other.bits[i]

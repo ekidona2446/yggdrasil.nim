@@ -81,7 +81,8 @@ proc encrypt*(init: SessionInit, ourEd: EdKeyPair, toEdPub: Ed25519PublicKey,
   payload.writeU64be(init.keySeq)
   payload.writeU64be(init.seq)
 
-  let ciphertext = boxSeal(payload, nonceForU64(0), toCurve, eph.sk)
+  let shared = precompute(toCurve, eph.sk)
+  let ciphertext = boxSealAfterPrecompute(payload, nonceForU64(0), shared)
   result.add msgType
   for b in eph.pk: result.add b
   for b in ciphertext: result.add b
@@ -94,9 +95,19 @@ proc decryptSessionInit*(data: openArray[byte], ourCurveSk: Curve25519SecretKey,
   for i in 0 ..< 32: eph[i] = data[1 + i]
   var ciphertext: seq[byte]
   for i in 33 ..< data.len: ciphertext.add data[i]
+  let ourCurvePk = block:
+    var pk: Curve25519PublicKey
+    # Derive our Curve25519 public key from our Curve25519 secret key
+    # In libsodium, crypto_scalarmult_base gives us the public key from the secret
+    # But we already have it stored - for now derive from Ed public
+    # Actually we need the box public key corresponding to ourCurveSk
+    # Go does: getShared(&shared, &fromBox, priv) where priv is our box priv
+    # So we use fromBox (eph) as their public, ourCurveSk as our secret
+    pk
+  let shared = precompute(eph, ourCurveSk)
   var payload: seq[byte]
   try:
-    payload = boxOpen(ciphertext, nonceForU64(0), eph, ourCurveSk)
+    payload = boxOpenAfterPrecompute(ciphertext, nonceForU64(0), shared)
   except CatchableError:
     return none(DecodedSessionPacket)
   if payload.len != 64 + 32 + 32 + 8 + 8: return none(DecodedSessionPacket)
@@ -139,7 +150,8 @@ proc encryptTraffic*(localKeySeq, remoteKeySeq, nonce: uint64, nextPub: Curve255
   var inner: seq[byte]
   for b in nextPub: inner.add b
   for b in payload: inner.add b
-  let ciphertext = boxSeal(inner, nonceForU64(nonce), theirCurrent, ourSendSk)
+  let shared = precompute(theirCurrent, ourSendSk)
+  let ciphertext = boxSealAfterPrecompute(inner, nonceForU64(nonce), shared)
   for b in ciphertext: result.add b
 
 proc decryptTraffic*(data: openArray[byte], theirCurrent: Curve25519PublicKey,
@@ -148,9 +160,10 @@ proc decryptTraffic*(data: openArray[byte], theirCurrent: Curve25519PublicKey,
   if h.isNone: return none(tuple[header: TrafficHeader, nextPub: Curve25519PublicKey, payload: seq[byte]])
   var ciphertext: seq[byte]
   for i in h.get().encryptedOffset ..< data.len: ciphertext.add data[i]
+  let shared = precompute(theirCurrent, ourRecvSk)
   var inner: seq[byte]
   try:
-    inner = boxOpen(ciphertext, nonceForU64(h.get().nonce), theirCurrent, ourRecvSk)
+    inner = boxOpenAfterPrecompute(ciphertext, nonceForU64(h.get().nonce), shared)
   except CatchableError:
     return none(tuple[header: TrafficHeader, nextPub: Curve25519PublicKey, payload: seq[byte]])
   if inner.len < 32: return none(tuple[header: TrafficHeader, nextPub: Curve25519PublicKey, payload: seq[byte]])
