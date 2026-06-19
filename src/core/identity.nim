@@ -43,7 +43,7 @@ proc identityFromSeed*(seed: Bytes32, backend = ibDevelopment): NodeIdentity =
   result.ipv6 = deriveYggAddress(result.publicKey)
 
 proc save*(id: NodeIdentity, path: string) =
-  var content = "# yggdrasil-nim key file\n"
+  var content = "# yggdrasil.nim key file\n"
   content.add "backend=development\n"
   content.add "privateSeed=" & toHex(id.privateSeed) & "\n"
   content.add "publicKey=" & toHex(id.publicKey) & "\n"

@@ -1,22 +1,42 @@
-# yggdrasil-nim example configuration
+# yggdrasil.nim example configuration
 
 [Node]
-# Long-term key file. If it does not exist, a new identity is generated.
+# Private Ed25519 key storage file.
 keyfile = "yggdrasil.key"
-# Optional display name for admin/API output.
-name = "example-node"
+# Optional node display name.
+name = ""
+
+[Node.NodeInfo]
+# Additional node metadata visible to the network upon request.
+"tcp_ao" = "true"
+"implementation" = "yggdrasil.nim"
+"PQC" = "false"
 
 [Peers]
-# Static peers. IP addresses are allowed directly and bypass DNS.
+# List of outbound peer connection URIs.
 static = [
-  "quic://203.0.113.10:12345",
-  "tcp+tls://[2001:db8::10]:12345",
+  "tcp://1.2.3.4:12345",
+  "tls://example.com:443",
+  "tls://1.2.3.4:443?sni=example.com",
+  "ws://example.com:80/path",
+  "wss://example.com:443/path",
+  "quic://example.com:443",
+  "socks://proxy.local:1080/1.2.3.4:12345",
+  "sockstls://user:pass@proxy.local:1080/example.com:443?sni=example.com",
+  "tcp://1.2.3.4:12345?key=abcdef1234...&priority=1&password=secret",
 ]
+# Enable/disable multicast peer discovery on local network interfaces.
 multicast = true
+multicastInterface = ".*"
 multicastAddress = "ff02::114"
 multicastPort = 12345
-# Public peer lists may be HTTP or HTTPS and may use literal IP addresses.
-publicPeerLists = ["https://example.net/ygg/peers.txt"]
+# Official URLs and GitHub repositories for automatic peer harvesting.
+publicPeerLists = ["https://publicpeers.neilalexander.dev/publicnodes.json"]
+githubPeerRepos = ["yggdrasil-network/public-peers"]
+peerCheckInterval = "1d"
+# Maximum allowed ping (RTT) in milliseconds; slower peers are automatically pruned.
+maxPingMs = 150
+peerCacheFile = "peers_cache.json"
 peerExchange = true
 
 [CKR]
@@ -29,40 +49,41 @@ peerExchange = true
 # allowedSourceSubnets = ["10.10.0.0/16", "fd00:abcd::/48"]
 # dynamic = false
 
-[TUN]
+[Firewall]
+# Internal overlay firewall rules.
 enable = true
-name = "ygg0"
-mtu = 65535
-# Optional override. Normally derived from the public key.
-ipv6 = ""
-# Optional internal IPv4 address for legacy local services.
-ipv4 = "10.255.0.1/32"
+allowedPublicKeys = []
+blockedPublicKeys = []
+# Form a private sub-network by configuring the same group password.
+groupPassword = ""
+allowedOpenPorts = []
 
 [Proxy]
 enable = false
-# Use localhost to bind both 127.0.0.1 and ::1 for curl compatibility.
-listen = "localhost:1080"
+# Use [::1] to bind both 127.0.0.1 and ::1 for dual-stack compatibility.
+listen = "[::1]:1080"
 socks5 = true
 http = true
+# Proxy username and password authentication (leave blank for no auth).
+username = ""
+password = ""
 
 [DNS]
 enable = true
-# Use localhost to bind both 127.0.0.1 and ::1 for local DNS clients.
-listen = "localhost:5053"
-internalDomain = ".yg"
-hostsFile = "hosts.yg"
+listen = "[::1]:5053"
+hostsFile = "hosts"
 upstream = ["1.1.1.1:53", "8.8.8.8:53"]
 
 [Admin]
-# Multiple listen addresses are supported. `unix://` works on POSIX.
+# Local JSON-RPC admin control sockets.
 listen = ["unix://yggdrasil-admin.sock", "tcp://127.0.0.1:9001"]
 keepalive = true
 
 [Crypto]
-# The checked-in default backend is development-only. Production builds should
-# enable these and fail closed if dependencies are unavailable.
-postQuantum = true
+# For end-to-end encryption within Yggdrasil network.
+# May break compatibility with Go and Rust implementation.
+postQuantum = false
 kem = "ML-KEM-1024"
 identityCertificate = "Dilithium5+Ed25519"
 aead = "ChaCha20-Poly1305"
-perHopProtection = true
+perHopProtection = false

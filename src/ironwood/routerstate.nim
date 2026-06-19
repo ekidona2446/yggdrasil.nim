@@ -5,7 +5,7 @@
 ## memory and later driven by TCP/TLS/QUIC tasks. It coordinates peers, bloom
 ## filters, path lookup/notify, and encrypted sessions.
 
-import std/[tables, options, times, algorithm, monotimes]
+import std/[tables, options, times, algorithm, monotimes, strutils]
 import ../core/types
 import ../crypto/sodium
 import ./wire
@@ -131,7 +131,9 @@ proc updateAnnounce*(r: var RouterState, ann: RouterAnnounce): bool =
     if old.seq == ann.seq:
       let pc = cmpNodeId(old.parent, ann.parent)
       if pc < 0: return false
-      if pc == 0 and ann.nonce <= old.nonce: return false
+      # CRDT tie-break (must match yggdrasil-go network/router._update):
+      # for equal seq and equal parent, the *lower* nonce wins.
+      if pc == 0 and ann.nonce >= old.nonce: return false
   r.announces[ann.key] = ann
   r.infoTimes[ann.key] = getTime()
   r.coordsCache.clear()
@@ -478,6 +480,9 @@ proc maintenance*(r: var RouterState): RouterStep =
   if int((getTime() - r.lastRefresh).inSeconds) >= r.routerRefreshSeconds:
     r.refresh = true
     r.lastRefresh = getTime()
+  let (myRoot, myCoords) = r.rootAndPath(r.crypto.publicKey)
+  when defined(yggdebug):
+    stderr.writeLine "[STATE] root=" & short(myRoot) & " coords=[" & myCoords.join(",") & "] parent=" & short(r.currentParent()) & " announces=" & $r.announces.len & " peers=" & $r.peers.len
   let fix = r.fixParent()
   result.outbound.add fix.outbound
   result.events.add fix.events
@@ -568,6 +573,15 @@ proc handleFrame*(r: var RouterState, peerId: PeerId, frame: Frame): RouterStep 
       let accepted = r.updateAnnounce(ann)
       stderr.writeLine "[ironwood] announce key=" & short(ann.key) & " parent=" & short(ann.parent) & " seq=" & $ann.seq & " port=" & $ann.port & " accepted=" & $accepted
       if accepted:
+        if ann.key == r.crypto.publicKey:
+          # We accepted an announce for our OWN key from a peer. That means our
+          # seq was lower than what the peer remembered (e.g. we just restarted
+          # and lost our sequence counter). Force an immediate refresh so we
+          # re-run root/parent selection and re-announce with seq+1, overriding
+          # the stale info. Mirrors yggdrasil-go network/router._handleAnnounce.
+          r.refresh = true
+          r.doRoot1 = false
+          r.doRoot2 = true
         r.blooms.setOnTree(remoteKey, true)
         result.addEvent(reAnnounceStored, "parent=" & short(ann.parent), some(peerId), some(ann.key))
         ## Gossip newly accepted announcements to other direct peers.

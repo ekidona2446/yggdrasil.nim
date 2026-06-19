@@ -55,7 +55,7 @@ proc recvExact(sock: Socket, n: int, timeoutMs: int): seq[byte] =
     for c in chunk: result.add byte(ord(c) and 0xff)
 
 proc saveRouterCrypto*(path: string, crypto: RouterCrypto) =
-  writeFile(path, "# yggdrasil-nim Ed25519/libsodium key\nsecretKey=" & ubytes.toHex(crypto.secretKey) & "\n")
+  writeFile(path, "# yggdrasil.nim Ed25519/libsodium key\nsecretKey=" & ubytes.toHex(crypto.secretKey) & "\n")
 
 proc loadOrCreateRouterCrypto*(path: string): RouterCrypto =
   if fileExists(path):

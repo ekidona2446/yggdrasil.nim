@@ -46,6 +46,7 @@ type
     mtu*: int
     ipv6*: string
     ipv4*: string
+    tunFd*: cint
 
   TunAdapter* = ref object
     cfg*: TunConfig
@@ -197,7 +198,8 @@ proc candidateNames(requested: string): seq[string] =
 
 proc openTun*(cfg: TunConfig): TunAdapter =
   ## Open a TUN device on Linux. Robust to an already-claimed interface name
-  ## (falls back to the next free yggN) and sets up the async I/O bridge.
+  ## (falls back to the next free yggN) or pre-opened fd (from Android),
+  ## and sets up the async I/O bridge.
   result = TunAdapter(
     cfg: cfg, platform: tpLinux, opened: false,
     tunFd: cint(-1), running: false,
@@ -216,6 +218,12 @@ proc openTun*(cfg: TunConfig): TunAdapter =
   setSocketBufferSize(fds[1], 512 * 1024)
   result.asyncFd = fds[0]
   result.bridgeFd = fds[1]
+
+  if cfg.tunFd >= 0:
+    result.tunFd = cfg.tunFd
+    result.ifName = if cfg.name.len > 0: cfg.name else: "vpn"
+    result.opened = true
+    return
 
   # Allocate the interface, trying alternate names on conflict.
   var fd = cint(-1)

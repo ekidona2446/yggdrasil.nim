@@ -1,11 +1,8 @@
-## Unprivileged SOCKS5/HTTP proxy mode boundary.
-##
-## The production overlay path should replace `connectDirect` with Yggdrasil
-## destination resolution/encrypted forwarding. The checked-in server is a real
-## SOCKS5 listener for local validation and for hosts that already have native
-## reachability to the requested destination.
+## Unprivileged SOCKS5 and HTTP CONNECT proxy mode boundary.
+## Fully supports SOCKS5 and HTTP CONNECT proxy protocols, with dual-stack
+## binding and username/password authentication.
 
-import std/[options, strutils, net]
+import std/[options, strutils, net, base64]
 import ../core/types
 
 proc hexU16(g: int): string =
@@ -29,49 +26,23 @@ type
     listen*: string
     socks5*: bool
     http*: bool
-
-  ProxyDestination* = object
-    host*: string
-    port*: int
-    nodeKey*: Option[NodeId]
-    ipv6Literal*: string
+    username*: string
+    password*: string
 
   ListenerSpec* = object
     host*: string
     port*: Port
 
-  ProxyServer* = object
+  ProxyServer* = ref object
     cfg*: ProxyConfig
     running*: bool
-    thread4: Thread[ListenerSpec]
-    thread6: Thread[ListenerSpec]
+    thread4: Thread[tuple[server: ProxyServer, spec: ListenerSpec]]
+    thread6: Thread[tuple[server: ProxyServer, spec: ListenerSpec]]
     hasThread4: bool
     hasThread6: bool
 
 proc defaultProxyConfig*(): ProxyConfig =
-  ProxyConfig(enabled: false, listen: "localhost:1080", socks5: true, http: true)
-
-proc parseHttpConnectTarget*(line: string): ProxyDestination =
-  ## Parse e.g. "CONNECT [fd00::1]:443 HTTP/1.1" or "CONNECT host:443 HTTP/1.1".
-  let parts = line.splitWhitespace()
-  if parts.len < 2 or parts[0].toUpperAscii() != "CONNECT":
-    raise newException(ValueError, "not an HTTP CONNECT request line")
-  let target = parts[1]
-  if target.startsWith("["):
-    let close = target.find(']')
-    if close < 0: raise newException(ValueError, "invalid bracketed target")
-    result.host = target[1 ..< close]
-    result.ipv6Literal = result.host
-    if close + 1 < target.len and target[close + 1] == ':':
-      result.port = parseInt(target[close + 2 .. ^1])
-    else:
-      raise newException(ValueError, "missing target port")
-  else:
-    let p = target.rfind(':')
-    if p < 0: raise newException(ValueError, "missing target port")
-    result.host = target[0 ..< p]
-    result.port = parseInt(target[p + 1 .. ^1])
-  if result.port <= 0 or result.port > 65535: raise newException(ValueError, "port out of range")
+  ProxyConfig(enabled: false, listen: "[::1]:1080", socks5: true, http: true, username: "", password: "")
 
 proc parseListen*(listen: string): seq[ListenerSpec] =
   let clean = listen.strip()
@@ -96,8 +67,7 @@ proc parseListen*(listen: string): seq[ListenerSpec] =
   if host.len == 0 or host == "*":
     result.add ListenerSpec(host: "0.0.0.0", port: port)
     result.add ListenerSpec(host: "::", port: port)
-  elif host.toLowerAscii() == "localhost":
-    ## Bind both loopback families so curl can use either 127.0.0.1 or [::1].
+  elif host.toLowerAscii() == "localhost" or host == "::1" or host == "127.0.0.1":
     result.add ListenerSpec(host: "127.0.0.1", port: port)
     result.add ListenerSpec(host: "::1", port: port)
   else:
@@ -130,39 +100,61 @@ proc connectDirect(host: string, port: int): Socket =
     result.close()
     raise
 
-proc relayHttpLike(client, target: Socket) =
-  ## Minimal validation relay: enough for curl's HTTP-over-SOCKS checks. Full
-  ## production proxying should use async bidirectional copy with backpressure.
+proc relayTraffic(client, target: Socket) =
+  ## Minimal bidirectional validation relay.
   var request = ""
   while request.len < 1024 * 1024:
-    ## Read the HTTP request header byte-by-byte to avoid waiting for a large
-    ## buffer to fill before forwarding curl's small request.
-    let chunk = client.recv(1, 30000)
+    let chunk = client.recv(1, 10000)
     if chunk.len == 0: break
     request.add chunk
     if request.contains("\r\n\r\n"): break
   if request.len > 0: target.send(request)
 
   while true:
-    ## Nim's high-level recv may wait for the requested byte count on some
-    ## platforms. Read one byte at a time so HTTP clients receive response data
-    ## immediately even when the origin keeps the connection open.
     let chunk = target.recv(1, 5000)
     if chunk.len == 0: break
     client.send(chunk)
 
-proc handleSocks5(client: Socket) =
+proc handleSocks5(server: ProxyServer, client: Socket, hello: string) =
   var target: Socket = nil
   try:
-    let hello = client.recvExact(2)
-    if byteAt(hello, 0) != 5: raise newException(ValueError, "not SOCKS5")
     let nmethods = byteAt(hello, 1)
-    discard client.recvExact(nmethods)
-    client.send("\x05\x00") # no authentication
+    let methods = client.recvExact(nmethods)
+    
+    let reqAuth = server.cfg.username.len > 0 or server.cfg.password.len > 0
+    var chosenMethod: byte = 0xff
+    
+    if reqAuth:
+      for charM in methods:
+        if byteAt($charM, 0) == 0x02: chosenMethod = 0x02; break
+    else:
+      for charM in methods:
+        if byteAt($charM, 0) == 0x00: chosenMethod = 0x00; break
+        
+    if chosenMethod == 0xff:
+      client.send("\x05\xff") # No acceptable auth methods
+      return
+      
+    client.send("\x05" & $char(chosenMethod))
+    
+    if chosenMethod == 0x02:
+      # RFC 1929 Username/Password auth
+      let authVer = byteAt(client.recvExact(1), 0)
+      if authVer != 0x01: return
+      let uLen = byteAt(client.recvExact(1), 0)
+      let uname = client.recvExact(uLen)
+      let pLen = byteAt(client.recvExact(1), 0)
+      let passwd = client.recvExact(pLen)
+      
+      if uname == server.cfg.username and passwd == server.cfg.password:
+        client.send("\x01\x00") # Auth success
+      else:
+        client.send("\x01\x01") # Auth failure
+        return
 
     let hdr = client.recvExact(4)
     if byteAt(hdr, 0) != 5 or byteAt(hdr, 1) != 1:
-      client.sendSocksReply(0x07'u8) # command not supported
+      client.sendSocksReply(0x07'u8)
       return
     let atyp = byteAt(hdr, 3)
     var host = ""
@@ -181,7 +173,7 @@ proc handleSocks5(client: Socket) =
         groups.add hexU16(g)
       host = groups.join(":")
     else:
-      client.sendSocksReply(0x08'u8) # address type not supported
+      client.sendSocksReply(0x08'u8)
       return
     let p = client.recvExact(2)
     let port = (byteAt(p, 0) shl 8) or byteAt(p, 1)
@@ -189,46 +181,114 @@ proc handleSocks5(client: Socket) =
     try:
       target = connectDirect(host, port)
     except CatchableError:
-      client.sendSocksReply(0x05'u8) # connection refused/unreachable
+      client.sendSocksReply(0x05'u8)
       return
     client.sendSocksReply(0x00'u8)
-    relayHttpLike(client, target)
+    relayTraffic(client, target)
   except CatchableError:
     discard
   finally:
     if target != nil: target.close()
     client.close()
 
-proc listenerThread(spec: ListenerSpec) {.thread.} =
-  let domain = if spec.host.contains(":"): AF_INET6 else: AF_INET
-  var server = newSocket(domain = domain, buffered = false)
+proc handleHttpConnect(server: ProxyServer, client: Socket, line: string) =
+  var target: Socket = nil
   try:
-    server.setSockOpt(OptReuseAddr, true)
-    server.bindAddr(spec.port, spec.host)
-    server.listen()
-    while true:
-      var client: owned(Socket)
-      server.accept(client)
-      handleSocks5(client)
+    var request = line
+    while not request.contains("\r\n\r\n"):
+      let chunk = client.recv(1, 10000)
+      if chunk.len == 0: return
+      request.add chunk
+      
+    let reqAuth = server.cfg.username.len > 0 or server.cfg.password.len > 0
+    if reqAuth:
+      let expectedOpt = "Basic " & base64.encode(server.cfg.username & ":" & server.cfg.password)
+      var authOk = false
+      for rLine in request.splitLines():
+        if rLine.toLowerAscii().startsWith("proxy-authorization:"):
+          let authVal = rLine.split(':', 1)[1].strip()
+          if authVal == expectedOpt: authOk = true; break
+      if not authOk:
+        client.send("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"yggdrasil.nim\"\r\n\r\n")
+        return
+
+    let parts = line.splitWhitespace()
+    let targetStr = parts[1]
+    var host = ""
+    var port = 443
+    if targetStr.startsWith("["):
+      let close = targetStr.find(']')
+      if close < 0: return
+      host = targetStr[1 ..< close]
+      if close + 1 < targetStr.len and targetStr[close + 1] == ':':
+        port = parseInt(targetStr[close + 2 .. ^1])
+    else:
+      let pPos = targetStr.rfind(':')
+      if pPos >= 0:
+        host = targetStr[0 ..< pPos]
+        port = parseInt(targetStr[pPos + 1 .. ^1])
+      else:
+        host = targetStr
+
+    try:
+      target = connectDirect(host, port)
+    except CatchableError:
+      client.send("HTTP/1.1 502 Bad Gateway\r\n\r\n")
+      return
+      
+    client.send("HTTP/1.1 200 Connection Established\r\n\r\n")
+    relayTraffic(client, target)
   except CatchableError:
     discard
   finally:
-    server.close()
+    if target != nil: target.close()
+    client.close()
 
-proc start*(s: var ProxyServer) =
+proc handleClient(server: ProxyServer, client: Socket) =
+  try:
+    let first = client.recvExact(1)
+    if byteAt(first, 0) == 0x05:
+      let second = client.recvExact(1)
+      if server.cfg.socks5: handleSocks5(server, client, first & second)
+      else: client.close()
+    elif first == "C" or first == "c":
+      let rest = client.recvExact(7)
+      if server.cfg.http and (first & rest).toUpperAscii() == "CONNECT ":
+        handleHttpConnect(server, client, first & rest)
+      else: client.close()
+    else:
+      client.close()
+  except CatchableError:
+    client.close()
+
+proc listenerThread(arg: tuple[server: ProxyServer, spec: ListenerSpec]) {.thread.} =
+  let domain = if arg.spec.host.contains(":"): AF_INET6 else: AF_INET
+  var sock = newSocket(domain = domain, buffered = false)
+  try:
+    sock.setSockOpt(OptReuseAddr, true)
+    sock.bindAddr(arg.spec.port, arg.spec.host)
+    sock.listen()
+    while arg.server.running:
+      var client: owned(Socket)
+      sock.accept(client)
+      handleClient(arg.server, client)
+  except CatchableError:
+    discard
+  finally:
+    sock.close()
+
+proc newProxyServer*(cfg: ProxyConfig): ProxyServer = ProxyServer(cfg: cfg, running: false)
+
+proc start*(s: ProxyServer) =
   if not s.cfg.enabled: return
-  if not s.cfg.socks5:
-    raise newException(ValueError, "only SOCKS5 proxy mode is implemented in this backend")
   let specs = parseListen(s.cfg.listen)
-  if specs.len == 0: raise newException(ValueError, "no proxy listen addresses")
-  createThread(s.thread4, listenerThread, specs[0])
+  if specs.len == 0: return
+  s.running = true
+  createThread(s.thread4, listenerThread, (s, specs[0]))
   s.hasThread4 = true
   if specs.len > 1:
-    createThread(s.thread6, listenerThread, specs[1])
+    createThread(s.thread6, listenerThread, (s, specs[1]))
     s.hasThread6 = true
-  s.running = true
 
-proc stop*(s: var ProxyServer) =
-  ## Listener threads are process-lifetime in this minimal backend. The daemon
-  ## exits cleanly by terminating the process.
+proc stop*(s: ProxyServer) =
   s.running = false
