@@ -22,6 +22,7 @@ type
     sodium_init: proc(): cint {.cdecl, gcsafe.}
     randombytes_buf: proc(buf: pointer, size: csize_t) {.cdecl, gcsafe.}
     crypto_sign_keypair: proc(pk, sk: pointer): cint {.cdecl, gcsafe.}
+    crypto_sign_seed_keypair: proc(pk, sk: pointer, seed: pointer): cint {.cdecl, gcsafe.}
     crypto_sign_detached: proc(sig, siglen: pointer, msg: pointer, msglen: culonglong, sk: pointer): cint {.cdecl, gcsafe.}
     crypto_sign_verify_detached: proc(sig, msg: pointer, msglen: culonglong, pk: pointer): cint {.cdecl, gcsafe.}
     crypto_sign_ed25519_pk_to_curve25519: proc(curvePk, edPk: pointer): cint {.cdecl, gcsafe.}
@@ -53,6 +54,7 @@ proc loadSodium*(): SodiumApi =
   result.sodium_init = loadSym[typeof(result.sodium_init)](lib, "sodium_init")
   result.randombytes_buf = loadSym[typeof(result.randombytes_buf)](lib, "randombytes_buf")
   result.crypto_sign_keypair = loadSym[typeof(result.crypto_sign_keypair)](lib, "crypto_sign_keypair")
+  result.crypto_sign_seed_keypair = loadSym[typeof(result.crypto_sign_seed_keypair)](lib, "crypto_sign_seed_keypair")
   result.crypto_sign_detached = loadSym[typeof(result.crypto_sign_detached)](lib, "crypto_sign_detached")
   result.crypto_sign_verify_detached = loadSym[typeof(result.crypto_sign_verify_detached)](lib, "crypto_sign_verify_detached")
   result.crypto_sign_ed25519_pk_to_curve25519 = loadSym[typeof(result.crypto_sign_ed25519_pk_to_curve25519)](lib, "crypto_sign_ed25519_pk_to_curve25519")
@@ -85,6 +87,14 @@ proc newEd25519Keypair*(): tuple[pk: Ed25519PublicKey, sk: Ed25519SecretKey] =
   let s = loadSodium()
   if s.crypto_sign_keypair(addr result.pk[0], addr result.sk[0]) != 0:
     raise newException(SodiumError, "crypto_sign_keypair failed")
+
+proc ed25519KeypairFromSeed*(seed: array[32,byte]): tuple[pk: Ed25519PublicKey, sk: Ed25519SecretKey] =
+  ## Generate Ed25519 keypair from 32-byte seed, compatible with Go's ed25519.NewKeyFromSeed
+  let s = loadSodium()
+  if s.crypto_sign_seed_keypair(addr result.pk[0], addr result.sk[0], unsafeAddr seed[0]) != 0:
+    raise newException(SodiumError, "crypto_sign_seed_keypair failed")
+
+type Ed25519Seed* = array[32, byte]
 
 proc signDetached*(sk: Ed25519SecretKey, msg: openArray[byte]): Signature64 =
   {.cast(gcsafe).}:

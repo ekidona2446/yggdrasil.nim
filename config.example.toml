@@ -8,7 +8,6 @@ name = ""
 
 [Node.NodeInfo]
 # Additional node metadata visible to the network upon request.
-"tcp_ao" = "true"
 "implementation" = "yggdrasil.nim"
 "PQC" = "false"
 

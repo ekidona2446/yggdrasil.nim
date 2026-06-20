@@ -1,8 +1,3 @@
-## TCP/TLS/WebSocket/Unix peering boundary and TCP-AO policy hooks.
-##
-## The data-plane selector must call `canCarryInner` before selecting a stream
-## transport. This enforces the non-negotiable no-TCP-over-TCP rule.
-
 import std/net
 import ../core/types
 import ../core/tcp_ao
