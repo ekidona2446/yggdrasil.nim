@@ -1,12 +1,7 @@
-## QUIC peering using nim-lsquic.
+## QUIC peering using nim-lsquic (https://github.com/vacp2p/nim-lsquic).
 ##
 ## Full QUIC-based peer connections for Yggdrasil.  Uses the lsquic library
 ## wrapped by nim-lsquic with a Chronos-based async API.
-##
-## TCP-AO is intentionally absent here: it is a TCP-only feature (RFC 5925)
-## and has no meaning inside a UDP-based QUIC tunnel.  If peer authentication
-## is required, it is handled by the Yggdrasil wire protocol above the
-## transport layer.
 
 import std/[tables, sets, options, sequtils]
 import chronos
