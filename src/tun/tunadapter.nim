@@ -1,8 +1,4 @@
 ## TUN adapter — cross-platform facade.
-##
-## Dispatches to platform-specific implementations.
-## Currently implemented: Linux (/dev/net/tun)
-## Planned: macOS (utun), Windows (Wintun)
 
 import std/[options, strutils]
 import ../core/types

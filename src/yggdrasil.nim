@@ -12,6 +12,7 @@
 
 import std/[os, parseopt, strutils, options, sequtils, httpclient, net]
 import chronos
+import ./platform/platform
 import ./config/configuration
 import ./core/[identity, types, peermanager, tree, dht, ckr, publicpeers, yggdebug]
 import ./crypto/sodium
@@ -100,7 +101,7 @@ proc addDnsUpstreamsToConfig(path: string, servers: seq[string]) =
     if content.len > 0 and not content.endsWith("\n"): content.add "\n"
     content.add "\n[DNS]\n"
     content.add "enable = true\n"
-    content.add "listen = \"localhost:5053\"\n"
+    content.add "listen = "[::1]:5053"\n"
     content.add "upstream = ["
     for i, srv in servers:
       if i > 0: content.add ", "
@@ -139,7 +140,7 @@ proc writeGeneratedConfig(path: string, peers: seq[PublicPeer], listen: string, 
   toml.add "[DNS]\n"
   toml.add "enable = true\n"
   toml.add "# localhost binds both 127.0.0.1 and ::1 in the Nim DNS backend.\n"
-  toml.add "listen = \"localhost:5053\"\n"
+  toml.add "listen = "[::1]:5053"\n"
   toml.add "internalDomain = \".yg\"\n"
   toml.add "hostsFile = \"hosts\"\n"
   toml.add "# Public resolvers work before the overlay data plane exists. The Yggdrasil DNS\n"
@@ -160,7 +161,7 @@ proc writeGeneratedConfig(path: string, peers: seq[PublicPeer], listen: string, 
 
 proc tunToOverlay(tun: TunAdapter, pc: PacketConn) {.async.} =
   ## Read packets from TUN, write to overlay via PacketConn.
-  ## This is the "ingress" path: kernel → overlay.
+  ## This is the "ingress" path: kernel -> overlay.
   while tun.running:
     try:
       let packet = await tun.readPacket()
@@ -234,11 +235,12 @@ proc runDaemon(listenAddrs, peerUris: seq[string], keyfile: string,
       return
 
   let address = deriveYggAddress(crypto.publicKey)
+  let subnet = deriveYggSubnet(crypto.publicKey)
   let ipv6Str = toIPv6String(address)
   echo "yggdrasil.nim ", Version, " starting..."
   echo "publicKey=", short(crypto.publicKey)
   echo "address=", ipv6Str
-  # IPv6 subnet?
+  echo "subnet=", toSubnetString(subnet)
 
   var packetConn: PacketConn
   {.cast(gcsafe).}:
@@ -261,13 +263,15 @@ proc runDaemon(listenAddrs, peerUris: seq[string], keyfile: string,
   var tun: TunAdapter = nil
   if tunEnable:
     try:
+      let platformTun = getDefaultTunParams()
       let tunCfg = TunConfig(
         enable: true,
-        name: if tunName.len > 0: tunName else: "ygg0",
-        mtu: if tunMtu > 0: tunMtu else: 65535,
+        name: if tunName.len > 0: tunName else: platformTun.defaultName,
+        mtu: if tunMtu > 0: tunMtu else: platformTun.defaultMTU,
         ipv6: ipv6Str,
         ipv4: "",
       )
+      echo "TUN driver: ", platformTun.tunDriver, " (MTU: ", tunCfg.mtu, ")"
       tun = openTun(tunCfg)
       tun.configureInterface(ipv6Str, tunCfg.mtu)
       tun.configureRoutes()
@@ -277,7 +281,7 @@ proc runDaemon(listenAddrs, peerUris: seq[string], keyfile: string,
       # Start data plane
       asyncSpawn tunToOverlay(tun, packetConn)
       asyncSpawn overlayToTun(packetConn, tun)
-      echo "Data plane active: TUN ↔ PacketConn"
+      echo "Data plane active: TUN <-> PacketConn"
     except CatchableError as e:
       echo "TUN setup failed: ", e.msg
       echo "Continuing without TUN (proxy-only mode)"
@@ -294,12 +298,14 @@ proc runDaemon(listenAddrs, peerUris: seq[string], keyfile: string,
   # ── DNS ──────────────────────────────────────────────────────────────────
   if dnsEnable:
     var dns = initLocalDnsServer(LocalDnsConfig(
-      enable: true, listen: "localhost:5053",
+      enable: dnsEnable, listen: dnsListen, hostsPath: dnsHostsFile, upstream: dnsUpstream,
+    ))
+      
       internalDomain: ".yg", hostsPath: "hosts",
       upstream: @["1.1.1.1:53", "8.8.8.8:53"],
     ))
     dns.start()
-    echo "DNS resolver listening at localhost:5053"
+    echo "DNS resolver listening at ", dnsListen
 
   echo "Daemon running. Press Ctrl+C to exit."
   echo "Peers: ", peerUris.len, " configured | TUN: ", if tun != nil: tun.ifName else: "disabled"
@@ -545,11 +551,13 @@ proc main() =
 
   # Run async daemon
   let proxyListen = if socks5Addr.len > 0: socks5Addr else: cfg.proxy.listen
-  let tunName = if tunNameOverride.len > 0: tunNameOverride else: cfg.tun.name
+  let platformTun = getDefaultTunParams()
+  let tunName = if tunNameOverride.len > 0: tunNameOverride else: platformTun.defaultName
   waitFor runDaemon(
     listenAddrs, peerUris, cfg.node.keyfile,
     cfg.tun.enable, cfg.proxy.enable,
-    proxyListen, cfg.dns.enable,
+    proxyListen,
+    cfg.dns.enable, cfg.dns.listen, cfg.dns.hostsFile, cfg.dns.upstream,
     tunName, cfg.tun.mtu,
   )
 

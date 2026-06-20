@@ -63,7 +63,7 @@ type
     responses*: Table[NodeId, SigResFull]
     coordsCache*: Table[NodeId, Path]
     sentAnnounces*: Table[PeerId, seq[NodeId]]
-    keyMap*: Table[NodeId, NodeId]   ## bloom-transformed key → full public key
+    keyMap*: Table[NodeId, NodeId]   ## bloom-transformed key -> full public key
     ownSeq*: uint64
     lastMaintenance*: Time
     lastRefresh*: Time
@@ -299,7 +299,7 @@ proc sendPathNotifyTo*(r: var RouterState, peerId: PeerId, requester: NodeId, re
                        returnPath: Path): seq[FrameAction] =
   ## Create a PathNotify with our real tree coordinates and route it back to the
   ## requester via greedy lookup on the return path. Mirrors the Rust/Go
-  ## handle_lookup_internal → handle_notify_internal flow.
+  ## handle_lookup_internal -> handle_notify_internal flow.
   if not r.peers.hasKey(peerId): return
   let ownPath = r.cachedCoords(r.crypto.publicKey)
   let sig = r.crypto.signPathInfo(uint64(epochTime()), ownPath).toArr64()

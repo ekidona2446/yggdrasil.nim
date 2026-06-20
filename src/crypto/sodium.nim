@@ -1,4 +1,4 @@
-## Minimal runtime-loaded libsodium bindings for Ironwood/Yggdrasil crypto.
+## Runtime-loaded libsodium bindings for Ironwood/Yggdrasil crypto.
 ##
 ## This avoids link-time dependency on libsodium while giving production-grade
 ## primitives when libsodium is installed. Required for real Ironwood sessions:

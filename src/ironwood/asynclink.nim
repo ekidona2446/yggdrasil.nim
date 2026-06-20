@@ -694,11 +694,11 @@ proc dialQuicPeer(manager: LinkManager, uri: string, parsed: PeerUri) {.async.} 
               transp.close()
               state.close()
               continue
-            echo "connected (QUIC→TLS fallback) to ", short(remoteKey), " via ", uri
+            echo "connected (QUIC->TLS fallback) to ", short(remoteKey), " via ", uri
             backoffMs = 1000
             connected = true
             await manager.packetConn.handleConn(remoteKey, transp, priority)
-            echo "disconnected (QUIC→TLS) from ", short(remoteKey)
+            echo "disconnected (QUIC->TLS) from ", short(remoteKey)
           except Exception as e:
             echo "QUIC+meta error ", uri, ": ", e.msg
             try: transp.close()
