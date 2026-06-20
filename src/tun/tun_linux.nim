@@ -109,7 +109,7 @@ proc readAll(fd: cint, data: pointer, n: int): bool =
   ## Blocking read of exactly n bytes. Returns false on EOF/fatal error.
   var off = 0
   while off < n:
-    let r = posix.read(fd, cast[pointer](cast[ByteAddress](data) + ByteAddress(off)),
+    let r = posix.read(fd, cast[pointer](cast[uint](data) + uint(off)),
                        n - off)
     if r > 0: off += r
     elif r == 0: return false

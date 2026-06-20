@@ -3,7 +3,10 @@
 ## The data-plane selector must call `canCarryInner` before selecting a stream
 ## transport. This enforces the non-negotiable no-TCP-over-TCP rule.
 
+import std/net
 import ../core/types
+import ../core/tcp_ao
+import ../core/tcp_ao
 
 type
   TcpAoStatus* = enum taoUnsupported, taoAvailable, taoEnabled
@@ -12,10 +15,10 @@ type
     uri*: PeerUri
     tcpAo*: TcpAoStatus
     connected*: bool
+    aoKey*: TcpAoKey
 
-proc tcpAoSupported*(): TcpAoStatus =
-  when defined(linux):
-    ## Placeholder: production should probe TCP_AO sockopts.
+proc tcpAoStatus*(): TcpAoStatus =
+  if isTcpAoSupported():
     taoAvailable
   else:
     taoUnsupported
@@ -35,17 +38,25 @@ proc openTcpPeer*(uri: PeerUri, inner: InnerProtocol): TcpPeer =
     raise newException(ValueError, "not a TCP/stream peering URI")
   requireCanCarry(uri.kind, inner)
   result.uri = uri
-  result.tcpAo = tcpAoSupported()
+  result.tcpAo = tcpAoStatus()
   result.connected = false
 
 proc enableTcpAo*(p: var TcpPeer, key: openArray[byte]): bool =
   ## Linux TCP-AO integration point. Returns false if not supported.
-  when defined(linux):
-    if key.len == 0: return false
-    p.tcpAo = taoEnabled
-    true
-  else:
-    false
+  if not isTcpAoSupported():
+    return false
+  if key.len == 0:
+    return false
+  p.aoKey = newTcpAoKey(0, 1, "hmac-sha-1-96", key)
+  p.tcpAo = taoEnabled
+  true
+
+proc applyTcpAo*(p: TcpPeer, sock: Socket): bool =
+  ## Apply the configured TCP-AO key to a live socket. Must be called after
+  ## the TCP connection is established.
+  if p.tcpAo != taoEnabled:
+    return false
+  applyTcpAoToSocket(sock, p.aoKey)
 
 proc connect*(p: var TcpPeer) =
   ## Production: Chronos async TCP/TLS/WebSocket dial/listen.

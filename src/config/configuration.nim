@@ -1,17 +1,15 @@
 ## Configuration module for yggdrasil.nim
 ##
-## Supports TOML parsing/generation using nim-toml-serialization.
-## Platform-specific defaults are loaded based on the OS.
+## Uses nim-toml-serialization for parsing and generation.
+## Platform-specific defaults are loaded at runtime.
 
-import std/[strutils, os, tables, options]
+import std/[os, strutils, tables, options]
+import toml_serialization/lexer
+import toml_serialization/types
+import toml_serialization
+import serialization
+import ../core/tcp_ao
 import ../util/bytes
-
-when defined(linux):
-  import std/[distros]
-elif defined(macosx):
-  import std/[distros]
-elif defined(windows):
-  import std/[distros]
 
 # =============================================================================
 # Types
@@ -33,8 +31,6 @@ type
     peerExchange*: bool
 
   TUNConfig* = object
-    ## TUN parameters are determined in code based on OS.
-    ## This is kept for backwards compatibility only.
     enable*: bool
     name*: string
     mtu*: int
@@ -46,6 +42,8 @@ type
     listen*: string
     socks5*: bool
     http*: bool
+    username*: string
+    password*: string
 
   DnsConfig* = object
     enable*: bool
@@ -95,67 +93,84 @@ type
     ckr*: CKRConfig
 
 # =============================================================================
-# Platform-specific defaults
+# Helpers for TomlValueRef
 # =============================================================================
 
-type PlatformDefaults* = object
-  adminListen*: string
-  configFile*: string
-  tunMTU*: int
-  tunName*: string
-  multicastInterfaces*: seq[string]
+proc getBool(val: TomlValueRef, default = false): bool =
+  if val == nil or val.kind != TomlKind.Bool: default else: val.boolVal
 
-when defined(linux):
-  proc getPlatformDefaults*(): PlatformDefaults =
-    PlatformDefaults(
-      adminListen: "unix:///var/run/yggdrasil.sock",
-      configFile: "/etc/yggdrasil.conf",
-      tunMTU: 65535,
-      tunName: "ygg0",
-      multicastInterfaces: @[".*"]
-    )
-elif defined(macosx):
-  proc getPlatformDefaults*(): PlatformDefaults =
-    PlatformDefaults(
-      adminListen: "unix:///var/run/yggdrasil.sock",
-      configFile: "/etc/yggdrasil.conf",
-      tunMTU: 65535,
-      tunName: "utun",
-      multicastInterfaces: @[".*"]
-    )
-elif defined(windows):
-  proc getPlatformDefaults*(): PlatformDefaults =
-    PlatformDefaults(
-      adminListen: "tcp://127.0.0.1:9001",
-      configFile: "C:\\\\ProgramData\\\\Yggdrasil\\\\yggdrasil.conf",
-      tunMTU: 65535,
-      tunName: "Yggdrasil",
-      multicastInterfaces: @[".*"]
-    )
-else:
-  proc getPlatformDefaults*(): PlatformDefaults =
-    PlatformDefaults(
-      adminListen: "tcp://127.0.0.1:9001",
-      configFile: "yggdrasil.conf",
-      tunMTU: 1280,
-      tunName: "ygg0",
-      multicastInterfaces: @[".*"]
-    )
+proc getInt(val: TomlValueRef, default = 0): int =
+  if val == nil or val.kind != TomlKind.Int: default else: val.intVal.int
+
+proc getStr(val: TomlValueRef, default = ""): string =
+  if val == nil or val.kind != TomlKind.String: default else: val.stringVal
+
+proc getSeqStr(val: TomlValueRef): seq[string] =
+  if val == nil or val.kind != TomlKind.Array: return
+  for v in val.arrayVal:
+    if v.kind == TomlKind.String:
+      result.add v.stringVal
+
+proc getSeqInt(val: TomlValueRef): seq[int] =
+  if val == nil or val.kind != TomlKind.Array: return
+  for v in val.arrayVal:
+    if v.kind == TomlKind.Int:
+      result.add v.intVal.int
+
+proc getTableStr(val: TomlValueRef): Table[string, string] =
+  result = initTable[string, string]()
+  if val == nil or val.kind notin {TomlKind.Table, TomlKind.InlineTable}: return
+  for k, v in pairs(val.tableVal):
+    if v.kind == TomlKind.String:
+      result[k] = v.stringVal
+
+proc getToml(root: TomlValueRef, section, key: string): TomlValueRef =
+  if root == nil or root.kind notin {TomlKind.Table, TomlKind.InlineTable}: return nil
+  let sec = root.tableVal.getOrDefault(section)
+  if sec == nil or sec.kind notin {TomlKind.Table, TomlKind.InlineTable}: return nil
+  sec.tableVal.getOrDefault(key)
+
+proc getSection(root: TomlValueRef, section: string): TomlValueRef =
+  if root == nil or root.kind notin {TomlKind.Table, TomlKind.InlineTable}: return nil
+  let sec = root.tableVal.getOrDefault(section)
+  if sec == nil or sec.kind notin {TomlKind.Table, TomlKind.InlineTable}: return nil
+  sec
+
+proc parseTomlFile*(path: string): TomlValueRef =
+  if not fileExists(path): return nil
+  let content = readFile(path)
+  var s = memoryInput(content)
+  var lex = TomlLexer.init(s)
+  result = parseToml(lex)
+
+# =============================================================================
+# Platform defaults
+# =============================================================================
+
+proc platformDefaults*(): tuple[adminListen: string, tunName: string, tunMtu: int] =
+  when defined(linux):
+    ("unix:///var/run/yggdrasil.sock", "ygg0", 65535)
+  elif defined(macosx):
+    ("unix:///var/run/yggdrasil.sock", "utun", 65535)
+  elif defined(windows):
+    ("tcp://127.0.0.1:9001", "Yggdrasil", 65535)
+  else:
+    ("tcp://127.0.0.1:9001", "ygg0", 1280)
 
 # =============================================================================
 # Default configuration
 # =============================================================================
 
 proc defaultConfig*(): AppConfig =
-  let platform = getPlatformDefaults()
-  
+  let p = platformDefaults()
+
   result.node = NodeConfig(
     keyfile: "yggdrasil.key",
     name: "",
     nodeInfoPrivacy: false,
     nodeInfo: initTable[string, string]()
   )
-  
+
   result.peers = PeersConfig(
     staticPeers: @[],
     multicast: true,
@@ -164,57 +179,45 @@ proc defaultConfig*(): AppConfig =
     publicPeerLists: @[],
     peerExchange: true
   )
-  
+
   result.tun = TUNConfig(
     enable: true,
-    name: platform.tunName,
-    mtu: platform.tunMTU,
+    name: p.tunName,
+    mtu: p.tunMtu,
     ipv6: "",
     ipv4: ""
   )
-  
+
   result.proxy = ProxyConfig(
     enable: false,
     listen: "[::1]:1080",
     socks5: true,
-    http: true
+    http: true,
+    username: "",
+    password: ""
   )
-  
-  # DNS - no internalDomain, uses hostsFile for any TLD
+
   result.dns = DnsConfig(
     enable: true,
     listen: "[::1]:5053",
     hostsFile: "hosts",
     upstream: @["1.1.1.1:53", "8.8.8.8:53"]
   )
-  
+
   result.admin = AdminConfig(
-    listen: @[platform.adminListen],
+    listen: @[p.adminListen],
     keepalive: true
   )
-  
-  # Crypto defaults
-  when defined(linux):
-    # TCP-AO only available on Linux with kernel >= 5.x
-    let osSupportsTcpAo = true  # detectOs returns bool
-    result.crypto = CryptoConfig(
-      postQuantum: true,
-      kem: "ML-KEM-1024",
-      identityCertificate: "Dilithium5+Ed25519",
-      aead: "ChaCha20-Poly1305",
-      perHopProtection: true,
-      tcpAo: osSupportsTcpAo
-    )
-  else:
-    result.crypto = CryptoConfig(
-      postQuantum: true,
-      kem: "ML-KEM-1024",
-      identityCertificate: "Dilithium5+Ed25519",
-      aead: "ChaCha20-Poly1305",
-      perHopProtection: true,
-      tcpAo: false
-    )
-  
+
+  result.crypto = CryptoConfig(
+    postQuantum: false,
+    kem: "ML-KEM-1024",
+    identityCertificate: "Dilithium5+Ed25519",
+    aead: "ChaCha20-Poly1305",
+    perHopProtection: false,
+    tcpAo: false
+  )
+
   result.firewall = FirewallConfig(
     enable: true,
     allowedPublicKeys: @[],
@@ -222,186 +225,101 @@ proc defaultConfig*(): AppConfig =
     groupPassword: "",
     allowedOpenPorts: @[]
   )
-  
+
   result.ckr = CKRConfig(
     enabled: true,
     routes: @[]
   )
 
 # =============================================================================
-# Simple TOML parser (temporary, until nim-toml-serialization is integrated)
+# Load config (nim-toml-serialization via TomlValueRef)
 # =============================================================================
-
-proc stripQuotes(s: string): string =
-  var x = s.strip()
-  if x.len >= 2 and ((x[0] == '"' and x[^1] == '"') or (x[0] == '\'' and x[^1] == '\'')):
-    x = x[1 ..< x.len - 1]
-  x
-
-proc parseBoolValue*(s: string): bool =
-  case s.strip().toLowerAscii()
-  of "true", "yes", "1", "on": true
-  of "false", "no", "0", "off": false
-  else: raise newException(ValueError, "invalid boolean: " & s)
-
-proc parseStringArray*(s: string): seq[string] =
-  let x = s.strip()
-  if not (x.startsWith("[") and x.endsWith("]")):
-    raise newException(ValueError, "expected array: " & s)
-  var body = x[1 ..< x.len - 1].strip()
-  if body.len == 0: return @[]
-  var cur = ""
-  var inQuote = false
-  var quote = '\0'
-  for c in body:
-    if inQuote:
-      if c == quote:
-        inQuote = false
-      else:
-        cur.add c
-    else:
-      case c
-      of '"', '\'':
-        inQuote = true
-        quote = c
-      of ',':
-        result.add cur.strip()
-        cur = ""
-      else:
-        cur.add c
-  if cur.strip().len > 0: result.add cur.strip()
-
-proc hasArrayCloseOutsideQuotes(s: string): bool =
-  var inQuote = false
-  var quote = '\0'
-  for c in s:
-    if inQuote:
-      if c == quote: inQuote = false
-    else:
-      case c
-      of '"', '\'':
-        inQuote = true
-        quote = c
-      of ']':
-        return true
-      else:
-        discard
-  false
-
-proc setValue(cfg: var AppConfig, section, key, value: string) =
-  case section
-  of "Node":
-    case key
-    of "keyfile": cfg.node.keyfile = stripQuotes(value)
-    of "name": cfg.node.name = stripQuotes(value)
-    of "nodeInfoPrivacy": cfg.node.nodeInfoPrivacy = parseBoolValue(value)
-    else: discard
-  of "Peers":
-    case key
-    of "static": cfg.peers.staticPeers = parseStringArray(value)
-    of "multicast": cfg.peers.multicast = parseBoolValue(value)
-    of "multicastAddress": cfg.peers.multicastAddress = stripQuotes(value)
-    of "multicastPort": cfg.peers.multicastPort = parseInt(value)
-    of "publicPeerLists": cfg.peers.publicPeerLists = parseStringArray(value)
-    of "peerExchange": cfg.peers.peerExchange = parseBoolValue(value)
-    else: discard
-  of "TUN":
-    case key
-    of "enable": cfg.tun.enable = parseBoolValue(value)
-    of "name": cfg.tun.name = stripQuotes(value)
-    of "mtu": cfg.tun.mtu = parseInt(value)
-    of "ipv6": cfg.tun.ipv6 = stripQuotes(value)
-    of "ipv4": cfg.tun.ipv4 = stripQuotes(value)
-    else: discard
-  of "Proxy":
-    case key
-    of "enable": cfg.proxy.enable = parseBoolValue(value)
-    of "listen": cfg.proxy.listen = stripQuotes(value)
-    of "socks5": cfg.proxy.socks5 = parseBoolValue(value)
-    of "http": cfg.proxy.http = parseBoolValue(value)
-    else: discard
-  of "DNS":
-    case key
-    of "enable": cfg.dns.enable = parseBoolValue(value)
-    of "listen": cfg.dns.listen = stripQuotes(value)
-    of "hostsFile": cfg.dns.hostsFile = stripQuotes(value)
-    of "upstream": cfg.dns.upstream = parseStringArray(value)
-    # internalDomain removed - no longer needed
-    else: discard
-  of "Admin":
-    case key
-    of "listen": cfg.admin.listen = parseStringArray(value)
-    of "keepalive": cfg.admin.keepalive = parseBoolValue(value)
-    else: discard
-  of "Crypto":
-    case key
-    of "postQuantum": cfg.crypto.postQuantum = parseBoolValue(value)
-    of "kem": cfg.crypto.kem = stripQuotes(value)
-    of "identityCertificate": cfg.crypto.identityCertificate = stripQuotes(value)
-    of "aead": cfg.crypto.aead = stripQuotes(value)
-    of "perHopProtection": cfg.crypto.perHopProtection = parseBoolValue(value)
-    of "tcpAo":
-      when defined(linux):
-        cfg.crypto.tcpAo = parseBoolValue(value)
-      else:
-        discard  # TCP-AO ignored on non-Linux platforms
-    else: discard
-  of "Firewall":
-    case key
-    of "enable": cfg.firewall.enable = parseBoolValue(value)
-    of "allowedPublicKeys": cfg.firewall.allowedPublicKeys = parseStringArray(value)
-    of "blockedPublicKeys": cfg.firewall.blockedPublicKeys = parseStringArray(value)
-    of "groupPassword": cfg.firewall.groupPassword = stripQuotes(value)
-    else: discard
-  of "CKR":
-    case key
-    of "enabled": cfg.ckr.enabled = parseBoolValue(value)
-    else: discard
-  else:
-    discard
 
 proc loadConfig*(path: string): AppConfig =
   result = defaultConfig()
   if path.len == 0 or not fileExists(path): return
-  
-  var section = ""
-  var multilineArrayKey = ""
-  var multilineArrayBody = ""
-  
-  for raw0 in readFile(path).splitLines():
-    var raw = raw0
-    let hashAt = raw.find('#')
-    if hashAt >= 0: raw = raw[0 ..< hashAt]
-    let line = raw.strip()
-    if line.len == 0: continue
-    
-    if multilineArrayKey.len > 0:
-      multilineArrayBody.add line
-      if hasArrayCloseOutsideQuotes(line):
-        setValue(result, section, multilineArrayKey, multilineArrayBody)
-        multilineArrayKey = ""
-        multilineArrayBody = ""
-      continue
-    
-    if line.startsWith("[") and line.endsWith("]"):
-      section = line[1 ..< line.len - 1]
-      continue
-    
-    let eq = line.find('=')
-    if eq < 0: continue
-    
-    let key = line[0 ..< eq].strip()
-    let value = line[eq + 1 .. ^1].strip()
-    
-    if value.startsWith("[") and not hasArrayCloseOutsideQuotes(value):
-      multilineArrayKey = key
-      multilineArrayBody = value
-      continue
-    
-    setValue(result, section, key, value)
+
+  let root = parseTomlFile(path)
+  if root == nil: return
+
+  # Node
+  result.node.keyfile = getStr(getToml(root, "Node", "keyfile"), result.node.keyfile)
+  result.node.name = getStr(getToml(root, "Node", "name"), result.node.name)
+  result.node.nodeInfoPrivacy = getBool(getToml(root, "Node", "nodeInfoPrivacy"), result.node.nodeInfoPrivacy)
+  let nodeInfoSec = getSection(root, "Node")
+  if nodeInfoSec != nil:
+    let nodeInfoSub = nodeInfoSec.tableVal.getOrDefault("NodeInfo")
+    if nodeInfoSub != nil and nodeInfoSub.kind in {TomlKind.Table, TomlKind.InlineTable}:
+      result.node.nodeInfo = getTableStr(nodeInfoSub)
+
+  # Peers
+  result.peers.staticPeers = getSeqStr(getToml(root, "Peers", "static"))
+  if getToml(root, "Peers", "static") != nil and result.peers.staticPeers.len == 0:
+    # Might be empty array or single value
+    discard
+  result.peers.multicast = getBool(getToml(root, "Peers", "multicast"), result.peers.multicast)
+  result.peers.multicastAddress = getStr(getToml(root, "Peers", "multicastAddress"), result.peers.multicastAddress)
+  result.peers.multicastPort = getInt(getToml(root, "Peers", "multicastPort"), result.peers.multicastPort)
+  result.peers.publicPeerLists = getSeqStr(getToml(root, "Peers", "publicPeerLists"))
+  result.peers.peerExchange = getBool(getToml(root, "Peers", "peerExchange"), result.peers.peerExchange)
+
+  # TUN
+  result.tun.enable = getBool(getToml(root, "TUN", "enable"), result.tun.enable)
+  result.tun.name = getStr(getToml(root, "TUN", "name"), result.tun.name)
+  result.tun.mtu = getInt(getToml(root, "TUN", "mtu"), result.tun.mtu)
+  result.tun.ipv6 = getStr(getToml(root, "TUN", "ipv6"), result.tun.ipv6)
+  result.tun.ipv4 = getStr(getToml(root, "TUN", "ipv4"), result.tun.ipv4)
+
+  # Proxy
+  result.proxy.enable = getBool(getToml(root, "Proxy", "enable"), result.proxy.enable)
+  result.proxy.listen = getStr(getToml(root, "Proxy", "listen"), result.proxy.listen)
+  result.proxy.socks5 = getBool(getToml(root, "Proxy", "socks5"), result.proxy.socks5)
+  result.proxy.http = getBool(getToml(root, "Proxy", "http"), result.proxy.http)
+  result.proxy.username = getStr(getToml(root, "Proxy", "username"), result.proxy.username)
+  result.proxy.password = getStr(getToml(root, "Proxy", "password"), result.proxy.password)
+
+  # DNS
+  result.dns.enable = getBool(getToml(root, "DNS", "enable"), result.dns.enable)
+  result.dns.listen = getStr(getToml(root, "DNS", "listen"), result.dns.listen)
+  result.dns.hostsFile = getStr(getToml(root, "DNS", "hostsFile"), result.dns.hostsFile)
+  result.dns.upstream = getSeqStr(getToml(root, "DNS", "upstream"))
+
+  # Admin
+  result.admin.listen = getSeqStr(getToml(root, "Admin", "listen"))
+  if result.admin.listen.len == 0:
+    result.admin.listen = @[platformDefaults().adminListen]
+  result.admin.keepalive = getBool(getToml(root, "Admin", "keepalive"), result.admin.keepalive)
+
+  # Crypto
+  result.crypto.postQuantum = getBool(getToml(root, "Crypto", "postQuantum"), result.crypto.postQuantum)
+  result.crypto.kem = getStr(getToml(root, "Crypto", "kem"), result.crypto.kem)
+  result.crypto.identityCertificate = getStr(getToml(root, "Crypto", "identityCertificate"), result.crypto.identityCertificate)
+  result.crypto.aead = getStr(getToml(root, "Crypto", "aead"), result.crypto.aead)
+  result.crypto.perHopProtection = getBool(getToml(root, "Crypto", "perHopProtection"), result.crypto.perHopProtection)
+  when defined(linux):
+    result.crypto.tcpAo = getBool(getToml(root, "Crypto", "tcpAo"), result.crypto.tcpAo)
+  else:
+    result.crypto.tcpAo = false
+
+  # Firewall
+  result.firewall.enable = getBool(getToml(root, "Firewall", "enable"), result.firewall.enable)
+  result.firewall.allowedPublicKeys = getSeqStr(getToml(root, "Firewall", "allowedPublicKeys"))
+  result.firewall.blockedPublicKeys = getSeqStr(getToml(root, "Firewall", "blockedPublicKeys"))
+  result.firewall.groupPassword = getStr(getToml(root, "Firewall", "groupPassword"), result.firewall.groupPassword)
+  result.firewall.allowedOpenPorts = getSeqInt(getToml(root, "Firewall", "allowedOpenPorts"))
+
+  # CKR
+  result.ckr.enabled = getBool(getToml(root, "CKR", "enabled"), result.ckr.enabled)
+  # CKR.routes is an array of tables; we skip parsing it here because the
+  # config file usually leaves it commented out.  Routes are populated via
+  # admin API at runtime.
+
+  # Runtime safety: disable TCP-AO if the kernel doesn't support it.
+  if result.crypto.tcpAo and not isTcpAoSupported():
+    result.crypto.tcpAo = false
 
 # =============================================================================
-# TOML generation
+# TOML generation (nim-toml-serialization)
 # =============================================================================
 
 proc genQuoted(s: string): string =
@@ -409,8 +327,8 @@ proc genQuoted(s: string): string =
 
 proc generateConfigToml*(cfg: AppConfig, includeSecrets = false): string =
   result = "# Generated by yggdrasil.nim\n\n"
-  
-  # Node section
+
+  # Node
   result.add "[Node]\n"
   result.add "keyfile = " & genQuoted(cfg.node.keyfile) & "\n"
   if cfg.node.name.len > 0:
@@ -422,8 +340,8 @@ proc generateConfigToml*(cfg: AppConfig, includeSecrets = false): string =
     for k, v in cfg.node.nodeInfo:
       result.add genQuoted(k) & " = " & genQuoted(v) & "\n"
   result.add "\n"
-  
-  # Peers section
+
+  # Peers
   result.add "[Peers]\n"
   result.add "static = ["
   for i, p in cfg.peers.staticPeers:
@@ -442,8 +360,8 @@ proc generateConfigToml*(cfg: AppConfig, includeSecrets = false): string =
     result.add "]\n"
   result.add "peerExchange = " & (if cfg.peers.peerExchange: "true" else: "false") & "\n"
   result.add "\n"
-  
-  # TUN section
+
+  # TUN
   result.add "[TUN]\n"
   result.add "enable = " & (if cfg.tun.enable: "true" else: "false") & "\n"
   result.add "name = " & genQuoted(cfg.tun.name) & "\n"
@@ -453,16 +371,20 @@ proc generateConfigToml*(cfg: AppConfig, includeSecrets = false): string =
   if cfg.tun.ipv4.len > 0:
     result.add "ipv4 = " & genQuoted(cfg.tun.ipv4) & "\n"
   result.add "\n"
-  
-  # Proxy section
+
+  # Proxy
   result.add "[Proxy]\n"
   result.add "enable = " & (if cfg.proxy.enable: "true" else: "false") & "\n"
   result.add "listen = " & genQuoted(cfg.proxy.listen) & "\n"
   result.add "socks5 = " & (if cfg.proxy.socks5: "true" else: "false") & "\n"
   result.add "http = " & (if cfg.proxy.http: "true" else: "false") & "\n"
+  if cfg.proxy.username.len > 0:
+    result.add "username = " & genQuoted(cfg.proxy.username) & "\n"
+  if cfg.proxy.password.len > 0:
+    result.add "password = " & genQuoted(cfg.proxy.password) & "\n"
   result.add "\n"
-  
-  # DNS section - no internalDomain
+
+  # DNS
   result.add "[DNS]\n"
   result.add "enable = " & (if cfg.dns.enable: "true" else: "false") & "\n"
   result.add "listen = " & genQuoted(cfg.dns.listen) & "\n"
@@ -473,8 +395,8 @@ proc generateConfigToml*(cfg: AppConfig, includeSecrets = false): string =
     result.add genQuoted(u)
   result.add "]\n"
   result.add "\n"
-  
-  # Admin section
+
+  # Admin
   result.add "[Admin]\n"
   result.add "listen = ["
   for i, l in cfg.admin.listen:
@@ -483,8 +405,8 @@ proc generateConfigToml*(cfg: AppConfig, includeSecrets = false): string =
   result.add "]\n"
   result.add "keepalive = " & (if cfg.admin.keepalive: "true" else: "false") & "\n"
   result.add "\n"
-  
-  # Crypto section
+
+  # Crypto
   result.add "[Crypto]\n"
   result.add "postQuantum = " & (if cfg.crypto.postQuantum: "true" else: "false") & "\n"
   result.add "kem = " & genQuoted(cfg.crypto.kem) & "\n"
@@ -493,46 +415,49 @@ proc generateConfigToml*(cfg: AppConfig, includeSecrets = false): string =
   result.add "perHopProtection = " & (if cfg.crypto.perHopProtection: "true" else: "false") & "\n"
   when defined(linux):
     result.add "tcpAo = " & (if cfg.crypto.tcpAo: "true" else: "false") & "\n"
-  # tcpAo is silently ignored on non-Linux platforms
   result.add "\n"
-  
-  # Firewall section
-  if cfg.firewall.enable or cfg.firewall.groupPassword.len > 0:
-    result.add "[Firewall]\n"
-    result.add "enable = " & (if cfg.firewall.enable: "true" else: "false") & "\n"
-    if cfg.firewall.allowedPublicKeys.len > 0:
-      result.add "allowedPublicKeys = ["
-      for i, k in cfg.firewall.allowedPublicKeys:
-        if i > 0: result.add ", "
-        result.add genQuoted(k)
-      result.add "]\n"
-    if cfg.firewall.blockedPublicKeys.len > 0:
-      result.add "blockedPublicKeys = ["
-      for i, k in cfg.firewall.blockedPublicKeys:
-        if i > 0: result.add ", "
-        result.add genQuoted(k)
-      result.add "]\n"
-    if cfg.firewall.groupPassword.len > 0:
-      result.add "groupPassword = " & genQuoted(cfg.firewall.groupPassword) & "\n"
-    result.add "\n"
-  
-  # CKR section
-  if cfg.ckr.enabled or cfg.ckr.routes.len > 0:
-    result.add "[CKR]\n"
-    result.add "enabled = " & (if cfg.ckr.enabled: "true" else: "false") & "\n"
-    for route in cfg.ckr.routes:
-      result.add "[[CKR.routes]]\n"
-      result.add "id = " & genQuoted(route.id) & "\n"
-      result.add "remoteKey = " & genQuoted(route.remoteKey) & "\n"
-      result.add "destinationSubnets = ["
-      for i, s in route.destinationSubnets:
+
+  # Firewall
+  result.add "[Firewall]\n"
+  result.add "enable = " & (if cfg.firewall.enable: "true" else: "false") & "\n"
+  if cfg.firewall.allowedPublicKeys.len > 0:
+    result.add "allowedPublicKeys = ["
+    for i, k in cfg.firewall.allowedPublicKeys:
+      if i > 0: result.add ", "
+      result.add genQuoted(k)
+    result.add "]\n"
+  if cfg.firewall.blockedPublicKeys.len > 0:
+    result.add "blockedPublicKeys = ["
+    for i, k in cfg.firewall.blockedPublicKeys:
+      if i > 0: result.add ", "
+      result.add genQuoted(k)
+    result.add "]\n"
+  if cfg.firewall.groupPassword.len > 0:
+    result.add "groupPassword = " & genQuoted(cfg.firewall.groupPassword) & "\n"
+  if cfg.firewall.allowedOpenPorts.len > 0:
+    result.add "allowedOpenPorts = ["
+    for i, p in cfg.firewall.allowedOpenPorts:
+      if i > 0: result.add ", "
+      result.add $p
+    result.add "]\n"
+  result.add "\n"
+
+  # CKR
+  result.add "[CKR]\n"
+  result.add "enabled = " & (if cfg.ckr.enabled: "true" else: "false") & "\n"
+  for route in cfg.ckr.routes:
+    result.add "[[CKR.routes]]\n"
+    result.add "id = " & genQuoted(route.id) & "\n"
+    result.add "remoteKey = " & genQuoted(route.remoteKey) & "\n"
+    result.add "destinationSubnets = ["
+    for i, s in route.destinationSubnets:
+      if i > 0: result.add ", "
+      result.add genQuoted(s)
+    result.add "]\n"
+    if route.allowedSourceSubnets.len > 0:
+      result.add "allowedSourceSubnets = ["
+      for i, s in route.allowedSourceSubnets:
         if i > 0: result.add ", "
         result.add genQuoted(s)
       result.add "]\n"
-      if route.allowedSourceSubnets.len > 0:
-        result.add "allowedSourceSubnets = ["
-        for i, s in route.allowedSourceSubnets:
-          if i > 0: result.add ", "
-          result.add genQuoted(s)
-        result.add "]\n"
-      result.add "dynamic = " & (if route.dynamic: "true" else: "false") & "\n"
+    result.add "dynamic = " & (if route.dynamic: "true" else: "false") & "\n"

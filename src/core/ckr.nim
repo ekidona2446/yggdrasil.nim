@@ -88,15 +88,15 @@ proc addRoute*(t: var CkrTable, route: CkrRoute) =
       return
   t.routes.add route
 
-proc populateFromTunnelConfig*(t: var CkrTable, cfg: TunnelRoutingConfig) =
-  if not cfg.enable: return
-  for keyHex, cidrs in cfg.remoteSubnets:
+proc populateFromTunnelConfig*(t: var CkrTable, cfg: CKRConfig) =
+  if not cfg.enabled: return
+  for r in cfg.routes:
     try:
-      let key = nodeIdFromHex(keyHex.strip())
-      let route = parseCkrRoute("tunnel:" & short(key), key, cidrs, cidrs)
+      let key = nodeIdFromHex(r.remoteKey.strip())
+      let route = parseCkrRoute(r.id, key, r.destinationSubnets, r.allowedSourceSubnets, dynamic = r.dynamic)
       t.addRoute(route)
     except CatchableError as e:
-      stderr.writeLine "[ckr] invalid tunnel_routing entry for key " & keyHex & ": " & e.msg
+      stderr.writeLine "[ckr] invalid tunnel_routing entry for route " & r.id & ": " & e.msg
 
 proc removeRoute*(t: var CkrTable, id: string): bool =
   for i, r in t.routes:

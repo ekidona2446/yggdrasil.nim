@@ -7,7 +7,7 @@
 ## become reachable once the overlay data plane can route to `200::/7`/`300::/7`
 ## Yggdrasil addresses.
 
-import std/[options, strutils]
+import std/[options, strutils, tables]
 from std/net import Socket, Port, AF_INET, AF_INET6, SOCK_DGRAM, IPPROTO_UDP, newSocket, bindAddr, recvFrom, sendTo, setSockOpt, OptReuseAddr, close, getFd
 when defined(posix):
   from posix import TFdSet, FD_ZERO, FD_SET, Timeval, Time, Suseconds, select
@@ -19,8 +19,8 @@ type
 
   DnsAnswer* = object
     kind*: DnsAnswerKind
-    address*: Option[IpAddress]
-    ipv6*: Option[IPv6Address]
+    address*: Option[string]
+    ipv6*: Option[string]
     ttlSeconds*: int
 
   LocalDnsConfig* = object
@@ -82,9 +82,9 @@ proc parseListen*(listen: string): seq[DnsListenerSpec] =
 proc resolveFromHosts*(s: LocalDnsServer, query: string): Option[DnsAnswer] =
   ## Resolve from hosts file. Hosts file supports any TLD.
   let normalizedQuery = query.toLowerAscii()
-  if s.hosts.hasKey(normalizedQuery):
-    let entry = s.hosts[normalizedQuery]
-    result = some(DnsAnswer(kind: dnsHosts, address: some(entry.address), ipv6: some(entry.ipv6), ttlSeconds: 300))
+  if s.hosts.entries.hasKey(normalizedQuery):
+    let entry = s.hosts.entries[normalizedQuery]
+    result = some(DnsAnswer(kind: dnsHosts, address: some($entry), ipv6: none(string), ttlSeconds: 300))
   else:
     result = none(DnsAnswer)
 
@@ -99,14 +99,33 @@ proc resolveFromUpstream*(spec: DnsListenerSpec, query: string): Option[DnsAnswe
       if parts.len != 2: continue
       let upstreamHost = parts[0]
       let upstreamPort = Port(parseInt(parts[1]))
-      var sock = newSocket(domain: if upstreamHost.contains(':'): AF_INET6 else: AF_INET, 
-                           sockType: SOCK_DGRAM, protocol: IPPROTO_UDP)
+      var sock = net.newSocket(domain = if upstreamHost.contains(':'): AF_INET6 else: AF_INET, 
+                           sockType = SOCK_DGRAM, protocol = IPPROTO_UDP)
       defer: sock.close()
       # Simplified - would need real DNS packet handling
       discard
     except CatchableError:
       continue
   result = none(DnsAnswer)
+
+proc dnsListenerThread(spec: DnsListenerSpec) {.thread.} =
+  var sock = net.newSocket(domain = if spec.host.contains(':') or spec.host == "::": AF_INET6 else: AF_INET,
+                       sockType = SOCK_DGRAM, protocol = IPPROTO_UDP)
+  defer: sock.close()
+  sock.setSockOpt(OptReuseAddr, true)
+  try:
+    sock.bindAddr(spec.port, spec.host)
+    var buf = newString(512)
+    while true:
+      var clientAddr: net.IpAddress
+      var clientPort: Port
+      let n = sock.recvFrom(buf, buf.len, clientAddr, clientPort)
+      if n > 0:
+        # Simplified - would need real DNS packet handling
+        # For now just forward to upstream
+        discard
+  except CatchableError:
+    discard
 
 proc start*(s: var LocalDnsServer) =
   if not s.cfg.enable: return
@@ -124,23 +143,6 @@ proc start*(s: var LocalDnsServer) =
 
 proc stop*(s: var LocalDnsServer) =
   s.running = false
-
-proc dnsListenerThread(spec: DnsListenerSpec) {.thread.} =
-  var sock = newSocket(domain: if spec.host.contains(':') or spec.host == "::": AF_INET6 else: AF_INET,
-                       sockType: SOCK_DGRAM, protocol: IPPROTO_UDP)
-  defer: sock.close()
-  sock.setSockOpt(OptReuseAddr, true)
-  try:
-    sock.bindAddr(spec.port, spec.host)
-    var buf = newString(512)
-    while true:
-      let (n, addr) = sock.recvFrom(buf, buf.len)
-      if n > 0:
-        # Simplified - would need real DNS packet handling
-        # For now just forward to upstream
-        discard
-  except CatchableError:
-    discard
 
 proc running*(s: LocalDnsServer): bool = s.running
 
