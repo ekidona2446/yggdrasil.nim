@@ -269,7 +269,7 @@ proc listenerThread(arg: tuple[server: ProxyServer, spec: ListenerSpec]) {.threa
     sock.bindAddr(arg.spec.port, arg.spec.host)
     sock.listen()
     while arg.server.running:
-      var client: owned(Socket)
+      var client: Socket
       sock.accept(client)
       handleClient(arg.server, client)
   except CatchableError:

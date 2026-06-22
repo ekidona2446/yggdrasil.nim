@@ -1,7 +1,6 @@
 import std/net
 import ../core/types
 import ../core/tcp_ao
-import ../core/tcp_ao
 
 type
   TcpAoStatus* = enum taoUnsupported, taoAvailable, taoEnabled

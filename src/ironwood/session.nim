@@ -95,15 +95,6 @@ proc decryptSessionInit*(data: openArray[byte], ourCurveSk: Curve25519SecretKey,
   for i in 0 ..< 32: eph[i] = data[1 + i]
   var ciphertext: seq[byte]
   for i in 33 ..< data.len: ciphertext.add data[i]
-  let ourCurvePk = block:
-    var pk: Curve25519PublicKey
-    # Derive our Curve25519 public key from our Curve25519 secret key
-    # In libsodium, crypto_scalarmult_base gives us the public key from the secret
-    # But we already have it stored - for now derive from Ed public
-    # Actually we need the box public key corresponding to ourCurveSk
-    # Go does: getShared(&shared, &fromBox, priv) where priv is our box priv
-    # So we use fromBox (eph) as their public, ourCurveSk as our secret
-    pk
   let shared = precompute(eph, ourCurveSk)
   var payload: seq[byte]
   try:

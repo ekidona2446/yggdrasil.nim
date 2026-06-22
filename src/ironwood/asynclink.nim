@@ -39,11 +39,11 @@ const
 
 # ── Metadata encoding/decoding ──────────────────────────────────────────────
 
-proc putU16be(buf: var seq[byte], x: uint16) =
+proc putU16be*(buf: var seq[byte], x: uint16) =
   buf.add byte((x shr 8) and 0xff)
   buf.add byte(x and 0xff)
 
-proc readU16be(data: openArray[byte], off: int): uint16 =
+proc readU16be*(data: openArray[byte], off: int): uint16 =
   if off + 2 > data.len: raise newException(ValueError, "short uint16")
   (uint16(data[off]) shl 8) or uint16(data[off + 1])
 

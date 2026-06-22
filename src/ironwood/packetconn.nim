@@ -160,10 +160,7 @@ proc writeTo*(pc: PacketConn, dest: NodeId, data: seq[byte]): Future[void] {.asy
 
 proc handleConn*(pc: PacketConn, peerKey: NodeId, transport: StreamTransport,
                  priority: uint8 = 0): Future[void] {.async.} =
-  ## Handle a new or re-connected peer.
-  ## Sends rmAddPeer via the router channel, polls until the peer is registered,
-  ## then starts the frame loop. The router actor dispatches outbound frames
-  ## during maintenance ticks.
+  ## Handle a new or re-connected peer backed by a raw StreamTransport.
   let addMsg = RouterMessage(kind: rmAddPeer, peerKey: peerKey, priority: priority)
   await pc.routerChan.addLast(addMsg)
   
@@ -184,6 +181,46 @@ proc handleConn*(pc: PacketConn, peerKey: NodeId, transport: StreamTransport,
     pc.peers.del(pid)
   
   let peer = newAsyncPeer(pid, peerKey, transport, pc.routerChan)
+  pc.peers[pid] = peer
+  pc.peerByKey[peerKey] = pid
+  
+  try:
+    await peer.run()
+  finally:
+    pc.peers.del(pid)
+    if pc.peerByKey.hasKey(peerKey) and pc.peerByKey[peerKey] == pid:
+      pc.peerByKey.del(peerKey)
+    let rmMsg = RouterMessage(kind: rmRemovePeer, peerId: pid, peerKey: peerKey)
+    try:
+      pc.routerChan.addLastNoWait(rmMsg)
+    except AsyncQueueFullError:
+      asyncSpawn pc.routerChan.addLast(rmMsg)
+
+proc handleConnStream*(pc: PacketConn, peerKey: NodeId,
+                      reader: AsyncStreamReader, writer: AsyncStreamWriter,
+                      transport: StreamTransport,
+                      priority: uint8 = 0): Future[void] {.async.} =
+  ## Handle a peer backed by an AsyncStreamReader/Writer (e.g. WebSocket or TLS).
+  let addMsg = RouterMessage(kind: rmAddPeer, peerKey: peerKey, priority: priority)
+  await pc.routerChan.addLast(addMsg)
+  
+  var pid: PeerId = 0
+  for attempt in 0 ..< 100:
+    let pidOpt = pc.state.peerIdFor(peerKey)
+    if pidOpt.isSome:
+      pid = pidOpt.get()
+      break
+    await sleepAsync(chronos.milliseconds(20))
+  
+  if pid == 0:
+    raise newException(ValueError, "peer not registered after addPeer")
+  
+  if pc.peers.hasKey(pid):
+    let oldPeer = pc.peers[pid]
+    oldPeer.close()
+    pc.peers.del(pid)
+  
+  let peer = newAsyncPeerStream(pid, peerKey, reader, writer, transport, pc.routerChan)
   pc.peers[pid] = peer
   pc.peerByKey[peerKey] = pid
   

@@ -4,7 +4,11 @@
 ## yggdrasil-go `meta` exchange for TCP-family peers so we can verify that a
 ## public peer socket is not merely open but speaks the expected Yggdrasil link
 ## handshake. After the metadata exchange, yggdrasil-go switches to the Ironwood
-## encrypted network/session layer, which is still listed as a gap.
+## encrypted network/session layer.
+##
+## Reuses wire helpers from ironwood/asynclink (putU16be/readU16be) and core
+## types (deriveYggAddress, ipv6Parse, keyPrefixForYggAddress) to avoid
+## duplicating protocol constants.
 
 import std/[net, os, osproc, strutils, times, options]
 import ./types
@@ -12,6 +16,7 @@ import ./peermanager
 import ../util/bytes
 import ../util/ipnet as ipnet
 import ../ironwood/wire
+import ../ironwood/asynclink
 
 type
   YggHandshakeResult* = object
@@ -32,14 +37,6 @@ const
   MetaVersionMinor = 1'u16
   MetaPublicKey = 2'u16
   MetaPriority = 3'u16
-
-proc putU16be(buf: var seq[byte], x: uint16) =
-  buf.add byte((x shr 8) and 0xff)
-  buf.add byte(x and 0xff)
-
-proc readU16be(data: openArray[byte], off: int): uint16 =
-  if off + 2 > data.len: raise newException(ValueError, "short uint16")
-  (uint16(data[off]) shl 8) or uint16(data[off + 1])
 
 proc rawBytesToString(data: openArray[byte]): string =
   result = newString(data.len)
@@ -98,58 +95,6 @@ proc opensslEd25519SignRaw(pemPath: string, data: openArray[byte]): seq[byte] =
   runOpenSsl(@["pkeyutl", "-sign", "-rawin", "-inkey", pemPath.quoteShell, "-in", inPath.quoteShell, "-out", outPath.quoteShell])
   result = readFileBytes(outPath)
   if result.len != 64: raise newException(ValueError, "unexpected Ed25519 signature length")
-
-proc yggKeyForAddress*(address: IPv6Address): NodeId =
-  ## yggdrasil-go-compatible address.Address.GetKey implementation. For a
-  ## destination address this yields the partial public key used by path lookup.
-  let ones = int(address[1])
-  for idx in 0 ..< ones:
-    result.bytes[idx div 8] = result.bytes[idx div 8] or (0x80'u8 shr (idx mod 8))
-  let keyOffset = ones + 1
-  let addrOffset = 16
-  for idx in addrOffset ..< 8 * 16:
-    var bits = address[idx div 8] and (0x80'u8 shr (idx mod 8))
-    bits = bits shl (idx mod 8)
-    let keyIdx = keyOffset + (idx - addrOffset)
-    bits = bits shr (keyIdx mod 8)
-    let keyByte = keyIdx div 8
-    if keyByte >= 32: break
-    result.bytes[keyByte] = result.bytes[keyByte] or bits
-  for i in 0 ..< 32: result.bytes[i] = not result.bytes[i]
-
-proc parseYggdrasilIPv6*(s: string): IPv6Address =
-  var host = s.strip()
-  if host.startsWith("[") and host.endsWith("]"): host = host[1 ..< host.len - 1]
-  let ip = ipnet.parseIpAddress(host)
-  if ip.family != ipnet.ifIPv6: raise newException(ValueError, "expected IPv6 address")
-  for i in 0 ..< 16: result[i] = ip.bytes[i]
-
-proc yggAddressForKey*(pub: NodeId): IPv6Address =
-  ## yggdrasil-go-compatible address.AddrForKey implementation.
-  var inv: array[32, byte]
-  for i in 0 ..< 32: inv[i] = not pub.bytes[i]
-  var temp: seq[byte]
-  var done = false
-  var ones: byte = 0
-  var bits: byte = 0
-  var nBits = 0
-  for idx in 0 ..< 256:
-    let bit = (inv[idx div 8] and (0x80'u8 shr (idx mod 8))) shr (7 - (idx mod 8))
-    if not done and bit != 0:
-      inc ones
-      continue
-    if not done and bit == 0:
-      done = true
-      continue
-    bits = (bits shl 1) or bit
-    inc nBits
-    if nBits == 8:
-      nBits = 0
-      temp.add bits
-      bits = 0
-  result[0] = 0x02'u8
-  result[1] = ones
-  for i in 0 ..< min(14, temp.len): result[2 + i] = temp[i]
 
 proc encodeMetadata*(pemPath: string, priority: byte = 0): tuple[publicKey: NodeId, bytes: seq[byte]] =
   result.publicKey = NodeId(bytes: opensslPublicKeyRaw(pemPath))
@@ -233,7 +178,7 @@ proc performYggdrasilTcpMetadataHandshake*(uri: string, keyPemPath: string, time
     result.remoteMajor = remote.major
     result.remoteMinor = remote.minor
     result.remotePriority = remote.priority
-    result.remoteAddress = yggAddressForKey(remote.publicKey)
+    result.remoteAddress = deriveYggAddress(remote.publicKey)
     if remote.major != ProtocolVersionMajor or remote.minor != ProtocolVersionMinor:
       raise newException(ValueError, "incompatible remote protocol version " & $remote.major & "." & $remote.minor)
     result.ok = true
@@ -295,7 +240,7 @@ proc probeYggdrasilTcpIronwood*(uri: string, keyPemPath: string, seconds = 5, ti
   var metaWire = hdr
   for b in body: metaWire.add b
   let remote = decodeMetadata(metaWire)
-  let remoteAddr = yggAddressForKey(remote.publicKey)
+  let remoteAddr = deriveYggAddress(remote.publicKey)
   result.add "META remoteKey=" & toHex(remote.publicKey) & " remoteAddr=" & toIPv6String(remoteAddr) &
     " version=" & $remote.major & "." & $remote.minor
 
@@ -310,8 +255,8 @@ proc probeYggdrasilTcpIronwood*(uri: string, keyPemPath: string, seconds = 5, ti
   result.add "SENT SigReq seq=" & $ourReqSeq & " nonce=" & $ourReqNonce & " bytes=" & $ourReqFrame.len
 
   if targetAddress.len > 0:
-    let targetIp = parseYggdrasilIPv6(targetAddress)
-    let destKey = yggKeyForAddress(targetIp)
+    let targetIp = ipv6Parse(targetAddress)
+    let destKey = keyPrefixForYggAddress(targetIp)
     let lookup = PathLookup(source: local.publicKey, dest: destKey, fromPath: @[])
     let frame = encodeFrame(iwProtoPathLookup, encodePathLookup(lookup))
     sock.send(rawBytesToString(frame))

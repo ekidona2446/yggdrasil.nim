@@ -11,7 +11,7 @@ when defined(linux):
   proc currentPlatform*(): TunPlatform = tpLinux
   
   proc defaultTunConfig*(): TunConfig =
-    TunConfig(enable: true, name: "ygg0", mtu: 65535, ipv6: "", ipv4: "")
+    TunConfig(enable: true, name: "ygg0", mtu: 65535, ipv6: "", ipv4: "", tunFd: cint(-1))
   
 elif defined(macosx):
   type
@@ -58,7 +58,7 @@ elif defined(windows):
     
   proc currentPlatform*(): TunPlatform = tpWindows
   proc defaultTunConfig*(): TunConfig =
-    TunConfig(enable: true, name: "ygg0", mtu: 65535, ipv6: "", ipv4: "")
+    TunConfig(enable: true, name: "ygg0", mtu: 65535, ipv6: "", ipv4: "", tunFd: cint(-1))
   proc openTun*(cfg: TunConfig): TunAdapter =
     raise newException(OSError, "Windows TUN not yet implemented")
   proc configureInterface*(tun: TunAdapter, ipv6: string, mtu: int = 65535) = discard

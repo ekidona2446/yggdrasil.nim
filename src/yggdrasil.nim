@@ -17,7 +17,7 @@ import toml_serialization/lexer
 import toml_serialization/types
 
 import ./config/configuration
-import ./core/[identity, types, peermanager, tree, dht, ckr, publicpeers, yggdebug, tcp_ao]
+import ./core/[identity, types, peermanager, tree, dht, ckr, publicpeers, tcp_ao]
 import ./crypto/sodium
 import ./ironwood/[wire, router, routerstate, packetconn, asynclink, asyncpeer, routertypes]
 import ./admin/api
@@ -149,6 +149,8 @@ proc writeGeneratedConfig(path: string, peers: seq[PublicPeer], listen: string, 
 
 proc tunToOverlay(tun: TunAdapter, pc: PacketConn) {.async.} =
   ## Read packets from TUN, write to overlay via PacketConn.
+  ## Mirrors Go's ipv6rwc: drop non-IPv6, non-Yggdrasil (200::/7, 300::/7),
+  ## and prefix with typeSessionTraffic (0x00) before handing to PacketConn.
   while tun.running:
     try:
       let packet = await tun.readPacket()
@@ -160,15 +162,18 @@ proc tunToOverlay(tun: TunAdapter, pc: PacketConn) {.async.} =
       if version == 6 and packet.len >= 40:
         var destAddr: IPv6Address
         for i in 0 ..< 16: destAddr[i] = packet[24 + i]
+        if destAddr[0] notin {0x02'u8, 0x03'u8}:
+          # Not a Yggdrasil unicast address (200::/7 or 300::/7); drop.
+          continue
         destKey = keyPrefixForYggAddress(destAddr)
-        stderr.writeLine "[dataplane] TUN->overlay dest=" & short(destKey) & " pktLen=" & $packet.len
+        stderr.writeLine "[dataplane] TUN -> overlay dest=" & toIPv6String(destAddr) & " pktLen=" & $packet.len
       elif version == 4 and packet.len >= 20:
         continue
       else:
         continue
 
       var framed = newSeq[byte](packet.len + 1)
-      framed[0] = 0x01'u8
+      framed[0] = 0x00'u8   # typeSessionTraffic, matches Go ironwood
       for i in 0 ..< packet.len: framed[1 + i] = packet[i]
       await pc.writeTo(destKey, framed)
     except CancelledError:
@@ -179,17 +184,18 @@ proc tunToOverlay(tun: TunAdapter, pc: PacketConn) {.async.} =
 
 proc overlayToTun(pc: PacketConn, tun: TunAdapter) {.async.} =
   ## Read deliveries from PacketConn, write to TUN.
+  ## Strips typeSessionTraffic (0x00) prefix before writing to TUN.
   var buf = newSeq[byte](65536)
   while tun.running:
     try:
       let (n, source) = await pc.readFrom(addr buf[0], buf.len)
       if n == 0: continue
       var offset = 0
-      if n > 0 and buf[0] == 0x01'u8:
+      if n > 0 and buf[0] == 0x00'u8:
         offset = 1
       let pktLen = n - offset
       if pktLen <= 0: continue
-      stderr.writeLine "[dataplane] overlay->TUN src=" & short(source) & " n=" & $pktLen
+      stderr.writeLine "[dataplane] overlay -> TUN src=" & short(source) & " n=" & $pktLen
       await tun.writePacket(buf[offset ..< n])
     except CancelledError:
       break
@@ -216,7 +222,7 @@ proc runDaemon(listenAddrs, peerUris: seq[string], keyfile: string,
   let subnet = deriveYggSubnet(crypto.publicKey)
   let ipv6Str = toIPv6String(address)
   echo "yggdrasil.nim ", Version, " starting..."
-  echo "publicKey=", short(crypto.publicKey)
+  echo "publicKey=", toHex(crypto.publicKey)
   echo "address=", ipv6Str
   echo "subnet=", toSubnetString(subnet)
 
@@ -250,7 +256,7 @@ proc runDaemon(listenAddrs, peerUris: seq[string], keyfile: string,
       discard
   if hasQuicPeers or listenAddrs.anyIt(it.startsWith("quic://")):
     quicMgr = newQuicManager(crypto)
-    quicMgr.init()
+    quicMgr.setupQuicManager()
     echo "QUIC manager initialized"
 
   # ── TUN adapter ─────────────────────────────────────────────────────────
@@ -264,6 +270,7 @@ proc runDaemon(listenAddrs, peerUris: seq[string], keyfile: string,
         mtu: if tunMtu > 0: tunMtu else: platformTun.mtu,
         ipv6: ipv6Str,
         ipv4: "",
+        tunFd: cint(-1),
       )
       echo "TUN driver: default (MTU: ", tunCfg.mtu, ")"
       tun = openTun(tunCfg)
@@ -359,7 +366,7 @@ Peer URI examples:
 """
 
 proc main() =
-  var configPath = if fileExists("config.example.toml"): "config.example.toml" else: ""
+  var configPath = ""
   var forceProxy = false
   var noTun = false
   var modeProxyOnly = false
