@@ -17,9 +17,10 @@ import toml_serialization/lexer
 import toml_serialization/types
 
 import ./config/configuration
-import ./core/[identity, types, peermanager, tree, dht, ckr, publicpeers, tcp_ao]
+import ./core/[identity, types, peermanager, tree, dht, ckr, publicpeers]
 import ./crypto/sodium
-import ./ironwood/[wire, router, routerstate, packetconn, asynclink, asyncpeer, routertypes]
+import ./ironwood/[wire, router, routerstate, packetconn, routertypes]
+import ./transport/[asynclink, asyncpeer]
 import ./admin/api
 import ./dns/localdns
 import ./transport/proxy
@@ -142,7 +143,6 @@ proc writeGeneratedConfig(path: string, peers: seq[PublicPeer], listen: string, 
   cfg.crypto.identityCertificate = "Dilithium5+Ed25519"
   cfg.crypto.aead = "ChaCha20-Poly1305"
   cfg.crypto.perHopProtection = false
-  cfg.crypto.tcpAo = false
   writeFile(path, generateConfigToml(cfg))
 
 # ── Data plane: TUN <-> PacketConn ───────────────────────────────────────

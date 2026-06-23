@@ -2,13 +2,15 @@
 ##
 ## Uses nim-toml-serialization for parsing and generation.
 ## Platform-specific defaults are loaded at runtime.
+##
+## NOTE: TCP-AO was removed (not needed for Yggdrasil).
+## TLS now planned to use WolfSSL instead of OpenSSL.
 
 import std/[os, strutils, tables, options]
 import toml_serialization/lexer
 import toml_serialization/types
 import toml_serialization
 import serialization
-import ../core/tcp_ao
 import ../util/bytes
 
 # =============================================================================
@@ -61,7 +63,7 @@ type
     identityCertificate*: string
     aead*: string
     perHopProtection*: bool
-    tcpAo*: bool
+    # tcpAo removed
 
   FirewallConfig* = object
     enable*: bool
@@ -214,8 +216,7 @@ proc defaultConfig*(): AppConfig =
     kem: "ML-KEM-1024",
     identityCertificate: "Dilithium5+Ed25519",
     aead: "ChaCha20-Poly1305",
-    perHopProtection: false,
-    tcpAo: false
+    perHopProtection: false
   )
 
   result.firewall = FirewallConfig(
@@ -254,9 +255,6 @@ proc loadConfig*(path: string): AppConfig =
 
   # Peers
   result.peers.staticPeers = getSeqStr(getToml(root, "Peers", "static"))
-  if getToml(root, "Peers", "static") != nil and result.peers.staticPeers.len == 0:
-    # Might be empty array or single value
-    discard
   result.peers.multicast = getBool(getToml(root, "Peers", "multicast"), result.peers.multicast)
   result.peers.multicastAddress = getStr(getToml(root, "Peers", "multicastAddress"), result.peers.multicastAddress)
   result.peers.multicastPort = getInt(getToml(root, "Peers", "multicastPort"), result.peers.multicastPort)
@@ -296,10 +294,6 @@ proc loadConfig*(path: string): AppConfig =
   result.crypto.identityCertificate = getStr(getToml(root, "Crypto", "identityCertificate"), result.crypto.identityCertificate)
   result.crypto.aead = getStr(getToml(root, "Crypto", "aead"), result.crypto.aead)
   result.crypto.perHopProtection = getBool(getToml(root, "Crypto", "perHopProtection"), result.crypto.perHopProtection)
-  when defined(linux):
-    result.crypto.tcpAo = getBool(getToml(root, "Crypto", "tcpAo"), result.crypto.tcpAo)
-  else:
-    result.crypto.tcpAo = false
 
   # Firewall
   result.firewall.enable = getBool(getToml(root, "Firewall", "enable"), result.firewall.enable)
@@ -310,13 +304,6 @@ proc loadConfig*(path: string): AppConfig =
 
   # CKR
   result.ckr.enabled = getBool(getToml(root, "CKR", "enabled"), result.ckr.enabled)
-  # CKR.routes is an array of tables; we skip parsing it here because the
-  # config file usually leaves it commented out.  Routes are populated via
-  # admin API at runtime.
-
-  # Runtime safety: disable TCP-AO if the kernel doesn't support it.
-  if result.crypto.tcpAo and not isTcpAoSupported():
-    result.crypto.tcpAo = false
 
 # =============================================================================
 # TOML generation (nim-toml-serialization)
@@ -413,8 +400,6 @@ proc generateConfigToml*(cfg: AppConfig, includeSecrets = false): string =
   result.add "identityCertificate = " & genQuoted(cfg.crypto.identityCertificate) & "\n"
   result.add "aead = " & genQuoted(cfg.crypto.aead) & "\n"
   result.add "perHopProtection = " & (if cfg.crypto.perHopProtection: "true" else: "false") & "\n"
-  when defined(linux):
-    result.add "tcpAo = " & (if cfg.crypto.tcpAo: "true" else: "false") & "\n"
   result.add "\n"
 
   # Firewall

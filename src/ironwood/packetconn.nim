@@ -13,7 +13,7 @@ import ./router
 import ./routerstate
 import ./bloom
 import ./session
-import ./asyncpeer
+import ../transport/asyncpeer
 import ./routertypes
 
 const
