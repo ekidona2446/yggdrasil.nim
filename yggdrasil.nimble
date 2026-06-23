@@ -13,4 +13,4 @@ requires "toml_serialization >= 0.2.0"
 # https://github.com/vacp2p/nim-lsquic
 requires "lsquic >= 0.5.2"
 # https://github.com/status-im/nim-websock
-requires "websock >- 0.4.0"
+requires "websock >= 0.4.0"
