@@ -5,7 +5,7 @@
 ## continuously reads Ironwood frames, dispatches them through `RouterState`, and
 ## writes resulting frames back to the peer.
 
-import std/[net, os, osproc, strutils, times, options]
+import std/[net, strutils, times, options]
 import ../core/[types, peermanager]
 import ../crypto/sodium
 import ../util/bytes as ubytes
@@ -53,46 +53,6 @@ proc recvExact(sock: Socket, n: int, timeoutMs: int): seq[byte] =
     let chunk = sock.recv(n - result.len, timeoutMs)
     if chunk.len == 0: raise newException(IOError, "socket closed")
     for c in chunk: result.add byte(ord(c) and 0xff)
-
-proc saveRouterCrypto*(path: string, crypto: RouterCrypto) =
-  writeFile(path, "# yggdrasil.nim Ed25519/libsodium key\nsecretKey=" & ubytes.toHex(crypto.secretKey) & "\n")
-
-proc loadOrCreateRouterCrypto*(path: string): RouterCrypto =
-  if fileExists(path):
-    for raw in readFile(path).splitLines():
-      let line = raw.strip()
-      if line.startsWith("secretKey="):
-        let bytes = ubytes.fromHex(line.split("=", 1)[1])
-        if bytes.len != 64: raise newException(ValueError, "invalid Ed25519 secret key length")
-        var sk: Ed25519SecretKey
-        for i in 0 ..< 64: sk[i] = bytes[i]
-        return routerCryptoFromSodium(sk)
-    raise newException(ValueError, "key file missing secretKey= line")
-  try:
-    result = newRouterCrypto()
-  except CatchableError:
-    ## Fallback key generation for config/bootstrap on systems without libsodium.
-    ## The resulting key file is usable once libsodium is available at runtime.
-    let pem = path & ".tmp.pem"
-    let der = path & ".tmp.der"
-    let pubder = path & ".tmp.pub.der"
-    defer:
-      for f in [pem, der, pubder]:
-        if fileExists(f): removeFile(f)
-    var res = execCmdEx("openssl genpkey -algorithm Ed25519 -out " & pem.quoteShell)
-    if res.exitCode != 0: raise newException(OSError, "openssl genpkey failed: " & res.output)
-    res = execCmdEx("openssl pkey -in " & pem.quoteShell & " -outform DER -out " & der.quoteShell)
-    if res.exitCode != 0: raise newException(OSError, "openssl private DER failed: " & res.output)
-    res = execCmdEx("openssl pkey -in " & pem.quoteShell & " -pubout -outform DER -out " & pubder.quoteShell)
-    if res.exitCode != 0: raise newException(OSError, "openssl public DER failed: " & res.output)
-    let d = readFile(der)
-    let p = readFile(pubder)
-    if d.len < 32 or p.len < 32: raise newException(ValueError, "OpenSSL produced short Ed25519 key")
-    for i in 0 ..< 32:
-      result.secretKey[i] = byte(ord(d[d.len - 32 + i]) and 0xff)
-      result.secretKey[32 + i] = byte(ord(p[p.len - 32 + i]) and 0xff)
-      result.publicKey.bytes[i] = result.secretKey[32 + i]
-  saveRouterCrypto(path, result)
 
 proc encodeMetadata*(crypto: RouterCrypto, priority: byte = 0, password: openArray[byte] = []): seq[byte] =
   var body: seq[byte]

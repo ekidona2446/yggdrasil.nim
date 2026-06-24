@@ -10,7 +10,7 @@
 ## - Admin socket (JSON-RPC)
 ## - DNS resolver
 
-import std/[os, parseopt, strutils, options, sequtils, httpclient, net]
+import std/[os, parseopt, strutils, options, sequtils]
 import chronos
 import toml_serialization
 import toml_serialization/lexer
@@ -18,7 +18,6 @@ import toml_serialization/types
 
 import ./config/configuration
 import ./core/[identity, types, peermanager, tree, dht, ckr, publicpeers]
-import ./crypto/sodium
 import ./ironwood/[wire, router, routerstate, packetconn, routertypes]
 import ./transport/[asynclink, asyncpeer]
 import ./admin/api
@@ -29,121 +28,6 @@ import ./tun/tunadapter
 import ./util/bytes as ubytes
 
 const Version* = "0.0.1"
-const DefaultPublicPeersUrl* = "https://publicpeers.neilalexander.dev/publicnodes.json"
-
-# ── Key management ───────────────────────────────────────────────────────────
-
-proc loadOrCreateRouterCrypto*(path: string): RouterCrypto =
-  ## Load or create Ed25519 keypair for Yggdrasil.
-  if fileExists(path):
-    for raw in readFile(path).splitLines():
-      let line = raw.strip()
-      if line.startsWith("secretKey="):
-        let bytes = ubytes.fromHex(line.split("=", 1)[1])
-        if bytes.len != 64:
-          raise newException(ValueError, "invalid Ed25519 secret key length")
-        var sk: Ed25519SecretKey
-        for i in 0 ..< 64: sk[i] = bytes[i]
-        return routerCryptoFromSodium(sk)
-    raise newException(ValueError, "key file missing secretKey= line")
-  result = newRouterCrypto()
-  writeFile(path, "# yggdrasil.nim Ed25519/libsodium key\nsecretKey=" &
-    ubytes.toHex(result.secretKey) & "\n")
-
-# ── Utility procs ───────────────────────────────────────────────────────────
-
-proc fetchText(source: string): string =
-  if source.startsWith("http://") or source.startsWith("https://"):
-    var client = newHttpClient(headers = newHttpHeaders({"User-Agent": "yggdrasil.nim/" & Version}))
-    result = client.getContent(source)
-  else:
-    result = readFile(source)
-
-proc tomlQuote(s: string): string =
-  result = "\"" & s.replace("\\", "\\\\").replace("\"", "\\\"") & "\""
-
-proc canTcpConnect(peer: PeerUri, timeoutMs = 2500): bool =
-  if peer.kind notin {tkTcp, tkTls, tkSocks, tkSocksTls, tkWebSocket, tkQuic}: return false
-  let host = if peer.kind in {tkSocks, tkSocksTls}:
-               peer.host.split('@')[^1].split(':')[0]
-             else: peer.host
-  let port = if peer.kind in {tkSocks, tkSocksTls}:
-               parseInt(peer.host.split('@')[^1].split(':')[1])
-             else: peer.port
-  let domain = if host.contains(":"): AF_INET6 else: AF_INET
-  var sock = newSocket(domain = domain, buffered = false)
-  try:
-    sock.connect(host, Port(port), timeout = timeoutMs)
-    result = true
-  except CatchableError:
-    result = false
-  finally:
-    sock.close()
-
-proc addDnsUpstreamsToConfig(path: string, servers: seq[string]) =
-  if servers.len == 0: return
-  var content = if fileExists(path): readFile(path) else: ""
-  var lines = content.splitLines()
-  var changed = false
-  var foundUpstream = false
-  for i in 0 ..< lines.len:
-    let stripped = lines[i].strip()
-    if stripped.startsWith("upstream") and stripped.contains("[") and stripped.contains("]"):
-      foundUpstream = true
-      var insert = ""
-      for srv in servers:
-        if not lines[i].contains(srv):
-          if insert.len > 0: insert.add ", "
-          insert.add tomlQuote(srv)
-      if insert.len > 0:
-        let pos = lines[i].rfind(']')
-        let needsComma = not lines[i][0 ..< pos].strip().endsWith("[")
-        lines[i] = lines[i][0 ..< pos] & (if needsComma: ", " else: "") & insert & lines[i][pos .. ^1]
-        changed = true
-      break
-  if not foundUpstream:
-    if content.len > 0 and not content.endsWith("\n"): content.add "\n"
-    content.add "\n[DNS]\n"
-    content.add "enable = true\n"
-    content.add "listen = \"[::1]:5053\"\n"
-    content.add "upstream = ["
-    for i, srv in servers:
-      if i > 0: content.add ", "
-      content.add tomlQuote(srv)
-    content.add "]\n"
-    writeFile(path, content)
-  else:
-    writeFile(path, lines.join("\n") & "\n")
-
-proc writeGeneratedConfig(path: string, peers: seq[PublicPeer], listen: string, keyfile: string,
-                          tunEnable, proxyEnable: bool) =
-  var cfg = defaultConfig()
-  cfg.node.keyfile = keyfile
-  cfg.node.name = "generated-node"
-  cfg.peers.staticPeers = newSeq[string]()
-  for p in peers: cfg.peers.staticPeers.add(p.uri)
-  cfg.peers.multicast = false
-  cfg.peers.peerExchange = true
-  cfg.peers.publicPeerLists = @[DefaultPublicPeersUrl]
-  cfg.tun.enable = tunEnable
-  cfg.tun.name = "ygg0"
-  cfg.tun.mtu = 65535
-  cfg.proxy.enable = proxyEnable
-  cfg.proxy.listen = listen
-  cfg.proxy.socks5 = true
-  cfg.proxy.http = true
-  cfg.dns.enable = true
-  cfg.dns.listen = "[::1]:5053"
-  cfg.dns.hostsFile = "hosts"
-  cfg.dns.upstream = @["1.1.1.1:53", "8.8.8.8:53"]
-  cfg.admin.listen = @["tcp://127.0.0.1:9001"]
-  cfg.admin.keepalive = true
-  cfg.crypto.postQuantum = false
-  cfg.crypto.kem = "ML-KEM-1024"
-  cfg.crypto.identityCertificate = "Dilithium5+Ed25519"
-  cfg.crypto.aead = "ChaCha20-Poly1305"
-  cfg.crypto.perHopProtection = false
-  writeFile(path, generateConfigToml(cfg))
 
 # ── Data plane: TUN <-> PacketConn ───────────────────────────────────────
 
@@ -448,12 +332,12 @@ proc main() =
     return
 
   if dnsToAdd.len > 0:
-    addDnsUpstreamsToConfig(configPath, dnsToAdd)
+    configuration.addDnsUpstreamsToConfig(configPath, dnsToAdd)
     echo "added ", dnsToAdd.len, " DNS upstream(s) to ", configPath
     return
 
   if publicPeersSource.len > 0:
-    let content = fetchText(publicPeersSource)
+    let content = configuration.fetchText(publicPeersSource)
     let summary = summarizePublicPeersJson(content)
     let peers = parsePublicPeersJson(content, onlyUp = true)
     echo "publicPeers ", summary
@@ -464,16 +348,7 @@ proc main() =
 
   if generateConfigPath.len > 0:
     if peerCount <= 0: quit "--peer-count must be positive", 2
-    let source = if publicPeersSource.len > 0: publicPeersSource else: DefaultPublicPeersUrl
-    let content = fetchText(source)
-    let allPeers = parsePublicPeersJson(content, onlyUp = true)
-    var selected: seq[PublicPeer]
-    for p in allPeers:
-      if p.parsed.kind notin {tkTcp, tkTls, tkQuic, tkWebSocket}: continue
-      if not canTcpConnect(p.parsed): continue
-      selected.add p
-      if selected.len >= peerCount: break
-    if selected.len == 0: quit "no reachable TCP/TLS/QUIC public peers found", 2
+    let source = if publicPeersSource.len > 0: publicPeersSource else: configuration.DefaultPublicPeersUrl
     let listen = if socks5Addr.len > 0: socks5Addr else: "localhost:1080"
     let keyfile = if keyOverride.len > 0: keyOverride else: "yggdrasil.key"
     try:
@@ -491,8 +366,8 @@ proc main() =
     elif modeProxyOnly:
       tunEnable = false
       proxyEnable = true
-    writeGeneratedConfig(generateConfigPath, selected, listen, keyfile, tunEnable, proxyEnable)
-    echo "generated ", generateConfigPath, " with ", selected.len, " reachable public peers; tun=", tunEnable, " proxy=", proxyEnable, " proxy listen=", listen
+    let n = configuration.generateReachableConfig(generateConfigPath, source, peerCount, listen, keyfile, tunEnable, proxyEnable)
+    echo "generated ", generateConfigPath, " with ", n, " reachable public peers; tun=", tunEnable, " proxy=", proxyEnable, " proxy listen=", listen
     return
 
   # Load config

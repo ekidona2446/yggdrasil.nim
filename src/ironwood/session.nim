@@ -242,6 +242,24 @@ proc doSend*(s: var SessionInfo, msg: openArray[byte]): seq[byte] =
                           msg, s.current, s.sendPriv)
   s.lastActivity = getTime()
 
+proc ratchet(s: var SessionInfo; remoteNextPub: Curve25519PublicKey) =
+  ## Rotate both remote and local key epochs after decrypting a message from the
+  ## remote's "next" key. Matches Rust/Yggdrasil-ng's maybe_ratchet_on_recv.
+  s.current = s.next
+  s.next = remoteNextPub
+  inc s.remoteKeySeq
+  s.recvPriv = s.sendPriv
+  s.recvPub = s.sendPub
+  s.sendPriv = s.nextPriv
+  s.sendPub = s.nextPub
+  let nxt = newCurve25519Keypair()
+  s.nextPriv = nxt.sk
+  s.nextPub = nxt.pk
+  inc s.localKeySeq
+  s.recvNonce = 0
+  s.nextSendNonce = 0
+  s.nextRecvNonce = 0
+
 proc doRecv*(s: var SessionInfo, msg: openArray[byte]): Option[seq[byte]] =
   let h = parseTrafficHeader(msg)
   if h.isNone: return none(seq[byte])
@@ -254,16 +272,12 @@ proc doRecv*(s: var SessionInfo, msg: openArray[byte]): Option[seq[byte]] =
     dec = decryptTraffic(msg, s.next, s.sendPriv)
     if dec.isSome:
       s.nextSendNonce = hh.nonce
-      s.current = s.next
-      s.next = dec.get().nextPub
-      inc s.remoteKeySeq
+      s.ratchet(dec.get().nextPub)
   elif hh.localKeySeq == s.remoteKeySeq + 1 and hh.remoteKeySeq + 1 == s.localKeySeq and hh.nonce > s.nextRecvNonce:
     dec = decryptTraffic(msg, s.next, s.recvPriv)
     if dec.isSome:
       s.nextRecvNonce = hh.nonce
-      s.current = s.next
-      s.next = dec.get().nextPub
-      inc s.remoteKeySeq
+      s.ratchet(dec.get().nextPub)
   else:
     return none(seq[byte])
   if dec.isNone: return none(seq[byte])
@@ -310,6 +324,7 @@ proc handleData*(m: var SessionManager, fromKey: Ed25519PublicKey, data: openArr
   case data[0]
   of SessionTypeInit:
     let init = decryptSessionInit(data, m.localCurveSk, fromKey)
+    stderr.writeLine "[session] Init from ", short(toNodeId(fromKey)), " decryptOk=", init.isSome
     if init.isNone: return @[]
     var made = m.createSessionFromInit(fromKey, init.get().init)
     var info = made.info
@@ -321,6 +336,7 @@ proc handleData*(m: var SessionManager, fromKey: Ed25519PublicKey, data: openArr
       result.add OutAction(kind: oaSendToInner, dest: fromKey, data: info.doSend(made.buffer.get()))
   of SessionTypeAck:
     let ack = decryptSessionInit(data, m.localCurveSk, fromKey)
+    stderr.writeLine "[session] Ack from ", short(toNodeId(fromKey)), " decryptOk=", ack.isSome
     if ack.isNone: return @[]
     if m.sessions.hasKey(fromKey):
       var info = m.sessions[fromKey]
@@ -338,6 +354,7 @@ proc handleData*(m: var SessionManager, fromKey: Ed25519PublicKey, data: openArr
     var info = m.sessions[fromKey]
     let plain = info.doRecv(data)
     m.sessions[fromKey] = info
+    stderr.writeLine "[session] Traffic from ", short(toNodeId(fromKey)), " decryptOk=", plain.isSome
     if plain.isSome: result.add OutAction(kind: oaDeliver, source: fromKey, data: plain.get())
   else:
     discard

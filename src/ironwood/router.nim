@@ -4,8 +4,10 @@
 ## signature-compatible pieces needed by the peer layer: SigReq/SigRes signing,
 ## RouterAnnounce creation/verification, and PathNotifyInfo signing.
 
+import std/[os, strutils]
 import ../core/types
 import ../crypto/sodium
+import ../util/bytes as ubytes
 import ./wire
 
 type
@@ -31,14 +33,32 @@ proc toSig64*(a: array[64, byte]): Signature64 =
 proc toArr64*(a: Signature64): array[64, byte] =
   for i in 0 ..< 64: result[i] = a[i]
 
-proc routerCryptoFromSodium*(sk: Ed25519SecretKey): RouterCrypto =
-  ## libsodium secret key stores public key in the last 32 bytes.
+proc routerCryptoFromEd25519*(sk: Ed25519SecretKey): RouterCrypto =
+  ## Monocypher/Ed25519 secret key layout is seed || public key (64 bytes).
   result.secretKey = sk
   for i in 0 ..< 32: result.publicKey.bytes[i] = sk[32 + i]
 
 proc newRouterCrypto*(): RouterCrypto =
   let kp = newEd25519Keypair()
-  routerCryptoFromSodium(kp.sk)
+  routerCryptoFromEd25519(kp.sk)
+
+proc saveRouterCrypto*(path: string; crypto: RouterCrypto) =
+  writeFile(path, "# yggdrasil.nim Ed25519/Monocypher key\nsecretKey=" & ubytes.toHex(crypto.secretKey) & "\n")
+
+proc loadOrCreateRouterCrypto*(path: string): RouterCrypto =
+  if fileExists(path):
+    for raw in readFile(path).splitLines():
+      let line = raw.strip()
+      if line.startsWith("secretKey="):
+        let bytes = ubytes.fromHex(line.split("=", 1)[1])
+        if bytes.len != 64:
+          raise newException(ValueError, "invalid Ed25519 secret key length")
+        var sk: Ed25519SecretKey
+        for i in 0 ..< 64: sk[i] = bytes[i]
+        return routerCryptoFromEd25519(sk)
+    raise newException(ValueError, "key file missing secretKey= line")
+  result = newRouterCrypto()
+  saveRouterCrypto(path, result)
 
 proc bytesForSig*(node, parent: NodeId, seq, nonce, port: uint64): seq[byte] =
   for b in node.bytes: result.add b

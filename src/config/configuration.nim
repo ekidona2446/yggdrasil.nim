@@ -6,12 +6,13 @@
 ## NOTE: TCP-AO was removed (not needed for Yggdrasil).
 ## TLS now planned to use WolfSSL instead of OpenSSL.
 
-import std/[os, strutils, tables, options]
+import std/[os, strutils, tables, options, httpclient, net]
 import toml_serialization/lexer
 import toml_serialization/types
 import toml_serialization
 import serialization
-import ../util/bytes
+import ../core/types
+import ../core/publicpeers
 
 # =============================================================================
 # Types
@@ -99,43 +100,43 @@ type
 # =============================================================================
 
 proc getBool(val: TomlValueRef, default = false): bool =
-  if val == nil or val.kind != TomlKind.Bool: default else: val.boolVal
+  if val.isNil or val.kind != TomlKind.Bool: default else: val.boolVal
 
 proc getInt(val: TomlValueRef, default = 0): int =
-  if val == nil or val.kind != TomlKind.Int: default else: val.intVal.int
+  if val.isNil or val.kind != TomlKind.Int: default else: val.intVal.int
 
 proc getStr(val: TomlValueRef, default = ""): string =
-  if val == nil or val.kind != TomlKind.String: default else: val.stringVal
+  if val.isNil or val.kind != TomlKind.String: default else: val.stringVal
 
 proc getSeqStr(val: TomlValueRef): seq[string] =
-  if val == nil or val.kind != TomlKind.Array: return
+  if val.isNil or val.kind != TomlKind.Array: return
   for v in val.arrayVal:
     if v.kind == TomlKind.String:
       result.add v.stringVal
 
 proc getSeqInt(val: TomlValueRef): seq[int] =
-  if val == nil or val.kind != TomlKind.Array: return
+  if val.isNil or val.kind != TomlKind.Array: return
   for v in val.arrayVal:
     if v.kind == TomlKind.Int:
       result.add v.intVal.int
 
 proc getTableStr(val: TomlValueRef): Table[string, string] =
   result = initTable[string, string]()
-  if val == nil or val.kind notin {TomlKind.Table, TomlKind.InlineTable}: return
+  if val.isNil or val.kind notin {TomlKind.Table, TomlKind.InlineTable}: return
   for k, v in pairs(val.tableVal):
     if v.kind == TomlKind.String:
       result[k] = v.stringVal
 
 proc getToml(root: TomlValueRef, section, key: string): TomlValueRef =
-  if root == nil or root.kind notin {TomlKind.Table, TomlKind.InlineTable}: return nil
+  if root.isNil or root.kind notin {TomlKind.Table, TomlKind.InlineTable}: return nil
   let sec = root.tableVal.getOrDefault(section)
-  if sec == nil or sec.kind notin {TomlKind.Table, TomlKind.InlineTable}: return nil
+  if sec.isNil or sec.kind notin {TomlKind.Table, TomlKind.InlineTable}: return nil
   sec.tableVal.getOrDefault(key)
 
 proc getSection(root: TomlValueRef, section: string): TomlValueRef =
-  if root == nil or root.kind notin {TomlKind.Table, TomlKind.InlineTable}: return nil
+  if root.isNil or root.kind notin {TomlKind.Table, TomlKind.InlineTable}: return nil
   let sec = root.tableVal.getOrDefault(section)
-  if sec == nil or sec.kind notin {TomlKind.Table, TomlKind.InlineTable}: return nil
+  if sec.isNil or sec.kind notin {TomlKind.Table, TomlKind.InlineTable}: return nil
   sec
 
 proc parseTomlFile*(path: string): TomlValueRef =
@@ -241,16 +242,16 @@ proc loadConfig*(path: string): AppConfig =
   if path.len == 0 or not fileExists(path): return
 
   let root = parseTomlFile(path)
-  if root == nil: return
+  if root.isNil: return
 
   # Node
   result.node.keyfile = getStr(getToml(root, "Node", "keyfile"), result.node.keyfile)
   result.node.name = getStr(getToml(root, "Node", "name"), result.node.name)
   result.node.nodeInfoPrivacy = getBool(getToml(root, "Node", "nodeInfoPrivacy"), result.node.nodeInfoPrivacy)
   let nodeInfoSec = getSection(root, "Node")
-  if nodeInfoSec != nil:
+  if not nodeInfoSec.isNil:
     let nodeInfoSub = nodeInfoSec.tableVal.getOrDefault("NodeInfo")
-    if nodeInfoSub != nil and nodeInfoSub.kind in {TomlKind.Table, TomlKind.InlineTable}:
+    if not nodeInfoSub.isNil and nodeInfoSub.kind in {TomlKind.Table, TomlKind.InlineTable}:
       result.node.nodeInfo = getTableStr(nodeInfoSub)
 
   # Peers
@@ -446,3 +447,119 @@ proc generateConfigToml*(cfg: AppConfig, includeSecrets = false): string =
         result.add genQuoted(s)
       result.add "]\n"
     result.add "dynamic = " & (if route.dynamic: "true" else: "false") & "\n"
+
+# =============================================================================
+# Public peer helpers and generated config (moved from yggdrasil.nim)
+# =============================================================================
+
+const DefaultPublicPeersUrl* = "https://publicpeers.neilalexander.dev/publicnodes.json"
+
+proc fetchText*(source: string): string =
+  if source.startsWith("http://") or source.startsWith("https://"):
+    var client = newHttpClient(headers = newHttpHeaders({"User-Agent": "yggdrasil.nim/0.0.1"}))
+    result = client.getContent(source)
+  else:
+    result = readFile(source)
+
+proc tomlQuote(s: string): string =
+  result = "\"" & s.replace("\\", "\\\\").replace("\"", "\\\"") & "\""
+
+proc canTcpConnect*(peer: PeerUri; timeoutMs = 2500): bool =
+  if peer.kind notin {tkTcp, tkTls, tkSocks, tkSocksTls, tkWebSocket, tkQuic}: return false
+  let host = if peer.kind in {tkSocks, tkSocksTls}:
+               peer.host.split('@')[^1].split(':')[0]
+             else: peer.host
+  let port = if peer.kind in {tkSocks, tkSocksTls}:
+               parseInt(peer.host.split('@')[^1].split(':')[1])
+             else: peer.port
+  let domain = if host.contains(":"): AF_INET6 else: AF_INET
+  var sock = newSocket(domain = domain, buffered = false)
+  try:
+    sock.connect(host, Port(port), timeout = timeoutMs)
+    result = true
+  except CatchableError:
+    result = false
+  finally:
+    sock.close()
+
+proc addDnsUpstreamsToConfig*(path: string; servers: seq[string]) =
+  if servers.len == 0: return
+  var content = if fileExists(path): readFile(path) else: ""
+  var lines = content.splitLines()
+  var changed = false
+  var foundUpstream = false
+  for i in 0 ..< lines.len:
+    let stripped = lines[i].strip()
+    if stripped.startsWith("upstream") and stripped.contains("[") and stripped.contains("]"):
+      foundUpstream = true
+      var insert = ""
+      for srv in servers:
+        if not lines[i].contains(srv):
+          if insert.len > 0: insert.add ", "
+          insert.add tomlQuote(srv)
+      if insert.len > 0:
+        let pos = lines[i].rfind(']')
+        let needsComma = not lines[i][0 ..< pos].strip().endsWith("[")
+        lines[i] = lines[i][0 ..< pos] & (if needsComma: ", " else: "") & insert & lines[i][pos .. ^1]
+        changed = true
+      break
+  if not foundUpstream:
+    if content.len > 0 and not content.endsWith("\n"): content.add "\n"
+    content.add "\n[DNS]\n"
+    content.add "enable = true\n"
+    content.add "listen = \"[::1]:5053\"\n"
+    content.add "upstream = ["
+    for i, srv in servers:
+      if i > 0: content.add ", "
+      content.add tomlQuote(srv)
+    content.add "]\n"
+    writeFile(path, content)
+  else:
+    writeFile(path, lines.join("\n") & "\n")
+
+proc writeGeneratedConfig*(path: string; peers: seq[PublicPeer]; listen: string; keyfile: string;
+                           tunEnable, proxyEnable: bool) =
+  var cfg = defaultConfig()
+  cfg.node.keyfile = keyfile
+  cfg.node.name = "generated-node"
+  cfg.peers.staticPeers = newSeq[string]()
+  for p in peers: cfg.peers.staticPeers.add(p.uri)
+  cfg.peers.multicast = false
+  cfg.peers.peerExchange = true
+  cfg.peers.publicPeerLists = @[DefaultPublicPeersUrl]
+  cfg.tun.enable = tunEnable
+  cfg.tun.name = "ygg0"
+  cfg.tun.mtu = 65535
+  cfg.proxy.enable = proxyEnable
+  cfg.proxy.listen = listen
+  cfg.proxy.socks5 = true
+  cfg.proxy.http = true
+  cfg.dns.enable = true
+  cfg.dns.listen = "[::1]:5053"
+  cfg.dns.hostsFile = "hosts"
+  cfg.dns.upstream = @["1.1.1.1:53", "8.8.8.8:53"]
+  cfg.admin.listen = @["tcp://127.0.0.1:9001"]
+  cfg.admin.keepalive = true
+  cfg.crypto.postQuantum = false
+  cfg.crypto.kem = "ML-KEM-1024"
+  cfg.crypto.identityCertificate = "Dilithium5+Ed25519"
+  cfg.crypto.aead = "ChaCha20-Poly1305"
+  cfg.crypto.perHopProtection = false
+  writeFile(path, generateConfigToml(cfg))
+
+proc generateReachableConfig*(path: string; peerSource: string; peerCount: int; listen: string;
+                            keyfile: string; tunEnable, proxyEnable: bool): int =
+  ## Fetch public peers, pick reachable ones, and write a TOML config file.
+  ## Returns the number of peers selected.
+  let content = fetchText(peerSource)
+  let allPeers = parsePublicPeersJson(content, onlyUp = true)
+  var selected: seq[PublicPeer]
+  for p in allPeers:
+    if p.parsed.kind notin {tkTcp, tkTls, tkQuic, tkWebSocket}: continue
+    if not canTcpConnect(p.parsed): continue
+    selected.add p
+    if selected.len >= peerCount: break
+  if selected.len == 0:
+    raise newException(IOError, "no reachable TCP/TLS/QUIC/WebSocket public peers found")
+  writeGeneratedConfig(path, selected, listen, keyfile, tunEnable, proxyEnable)
+  result = selected.len

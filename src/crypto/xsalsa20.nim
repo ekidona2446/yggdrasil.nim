@@ -1,9 +1,12 @@
-## XSalsa20 + Poly1305 implementation for crypto_box compatibility
-## Pure Nim implementation (no external dependencies except Poly1305 from Monocypher)
+## XSalsa20 + Poly1305 implementation for NaCl crypto_box compatibility.
+##
+## Uses Monocypher for the X25519 shared secret and Poly1305 MAC, and a pure
+## Nim Salsa20 core to provide the exact XSalsa20 stream required by the
+## Yggdrasil/Ironwood wire format.
 
 import monocypher
 
-proc rotl(x: uint32, n: int): uint32 {.inline.} =
+proc rotl(x: uint32; n: int): uint32 {.inline.} =
   (x shl n) or (x shr (32 - n))
 
 proc quarterRound(a, b, c, d: var uint32) =
@@ -79,52 +82,51 @@ const
 proc boxBeforenm*(k: var array[32, byte]; pk, sk: MonoKey32) =
   k = x25519(sk, pk)
 
-# Poly1305 binding from Monocypher
-# Windows? MacOS?
-proc crypto_poly1305*(mac, key, msg: pointer; msgSize: csize_t) {.importc, dynlib: "libmonocypher.so.4".}
-
 proc boxSealAfterPrecomputation*(c: var openArray[byte]; m: openArray[byte];
                                  n: array[24, byte]; k: array[32, byte]) =
+  if c.len != m.len + boxOverhead:
+    raise newException(ValueError, "output buffer must be message length + 16")
+
   var polyKey: array[32, byte]
   xsalsa20(polyKey, k, n, 0)
 
-  # Encrypt (counter starts at 1)
+  # Encrypt (counter starts at 1): XOR plaintext with the keystream
   if m.len > 0:
-    xsalsa20(c.toOpenArray(boxOverhead, boxOverhead + m.len - 1), k, n, 1)
-    copyMem(addr c[boxOverhead], unsafeAddr m[0], m.len)
+    var stream = newSeq[byte](m.len)
+    xsalsa20(stream, k, n, 1)
+    for i in 0 ..< m.len:
+      c[boxOverhead + i] = m[i] xor stream[i]
 
   # Compute Poly1305 tag over ciphertext
-  var mac: array[16, byte]
-  crypto_poly1305(addr mac[0], addr polyKey[0],
-                  if m.len > 0: addr c[boxOverhead] else: nil,
-                  csize_t(m.len))
-
-  # Prepend MAC
+  var mac: MonoMac16
+  poly1305(mac, polyKey, c.toOpenArray(boxOverhead, boxOverhead + m.len - 1))
   copyMem(addr c[0], addr mac[0], boxOverhead)
 
 proc boxOpenAfterPrecomputation*(m: var openArray[byte]; c: openArray[byte];
                                  n: array[24, byte]; k: array[32, byte]): bool =
-  if c.len < boxOverhead: return false
+  if c.len < boxOverhead or m.len != c.len - boxOverhead:
+    return false
 
   var polyKey: array[32, byte]
   xsalsa20(polyKey, k, n, 0)
 
   let ctLen = c.len - boxOverhead
-  var mac: array[16, byte]
-  crypto_poly1305(addr mac[0], addr polyKey[0],
-                  if ctLen > 0: unsafeAddr c[boxOverhead] else: nil,
-                  csize_t(ctLen))
+  var mac: MonoMac16
+  if ctLen > 0:
+    poly1305(mac, polyKey, c.toOpenArray(boxOverhead, boxOverhead + ctLen - 1))
+  else:
+    poly1305(mac, polyKey, [])
 
-  # Verify MAC
-  var expected: array[16, byte]
+  var expected: MonoMac16
   copyMem(addr expected[0], unsafeAddr c[0], 16)
-  if not equalMem(addr mac[0], addr expected[0], 16):
+  if not constantTimeEq(mac, expected):
     return false
 
-  # Decrypt
   if ctLen > 0:
-    xsalsa20(m.toOpenArray(0, ctLen-1), k, n, 1)
-    copyMem(addr m[0], unsafeAddr c[boxOverhead], ctLen)
+    var stream = newSeq[byte](ctLen)
+    xsalsa20(stream, k, n, 1)
+    for i in 0 ..< ctLen:
+      m[i] = c[boxOverhead + i] xor stream[i]
 
   true
 
