@@ -1,4 +1,4 @@
-## Minimal persistent Ironwood peer state machine.
+## Persistent Ironwood peer state machine.
 ##
 ## This layer turns decoded Ironwood frames into outbound frames and events. It is
 ## intentionally transport-agnostic; a TCP/TLS/QUIC task should feed frames in and

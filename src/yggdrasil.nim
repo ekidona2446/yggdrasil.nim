@@ -173,7 +173,7 @@ proc runDaemon(listenAddrs, peerUris: seq[string], keyfile: string,
   # ── Proxy ───────────────────────────────────────────────────────────────
   if proxyEnable:
     var ps = ProxyServer(
-      cfg: proxy.ProxyConfig(enabled: true, listen: proxyListen, socks5: true, http: true),
+      cfg: proxy.ProxyConfig(enabled: true, listen: proxyListen, socks5: true, http: true, username: "", password: "", hostsFile: dnsHostsFile),
       running: false,
     )
     ps.start()
@@ -349,14 +349,16 @@ proc main() =
   if generateConfigPath.len > 0:
     if peerCount <= 0: quit "--peer-count must be positive", 2
     let source = if publicPeersSource.len > 0: publicPeersSource else: configuration.DefaultPublicPeersUrl
-    let listen = if socks5Addr.len > 0: socks5Addr else: "localhost:1080"
+    let listen = if socks5Addr.len > 0: socks5Addr else: "[::1]:1080"
     let keyfile = if keyOverride.len > 0: keyOverride else: "yggdrasil.key"
     try:
       discard loadOrCreateRouterCrypto(keyfile)
     except CatchableError as e:
       quit "could not create keyfile " & keyfile & ": " & e.msg, 1
-    var tunEnable = false
-    var proxyEnable = true
+    # Default generated config is TUN-first.  Use --generate-proxy-config or
+    # --proxy-mode for the old proxy-only behaviour, and --tun-proxy-mode for both.
+    var tunEnable = true
+    var proxyEnable = false
     if modeTunOnly:
       tunEnable = true
       proxyEnable = false

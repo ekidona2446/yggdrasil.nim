@@ -121,6 +121,8 @@ proc readerLoop(peer: AsyncPeer) {.async.} =
   while peer.running:
     try:
       let frame = await readFrameFromReader(peer.reader)
+      if frame.packetType in {iwProtoPathBroken, iwTraffic}:
+        stderr.writeLine "[asyncpeer] recv peer=" & short(peer.remoteKey) & " type=" & $frame.packetType & " payloadLen=" & $frame.payload.len
       peer.lastReceived = getMonoTime()
       
       let msg = RouterMessage(

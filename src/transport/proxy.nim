@@ -4,6 +4,7 @@
 
 import std/[options, strutils, net, base64]
 import ../core/types
+import ../util/hostsfile
 
 proc hexU16(g: int): string =
   const Digits = "0123456789abcdef"
@@ -28,6 +29,7 @@ type
     http*: bool
     username*: string
     password*: string
+    hostsFile*: string
 
   ListenerSpec* = object
     host*: string
@@ -42,7 +44,7 @@ type
     hasThread6: bool
 
 proc defaultProxyConfig*(): ProxyConfig =
-  ProxyConfig(enabled: false, listen: "[::1]:1080", socks5: true, http: true, username: "", password: "")
+  ProxyConfig(enabled: false, listen: "[::1]:1080", socks5: true, http: true, username: "", password: "", hostsFile: "hosts")
 
 proc parseListen*(listen: string): seq[ListenerSpec] =
   let clean = listen.strip()
@@ -91,11 +93,36 @@ proc sendSocksReply(client: Socket, status: byte) =
   for i in 4 ..< 10: reply[i] = char(0)
   client.send(reply)
 
-proc connectDirect(host: string, port: int): Socket =
-  let domain = if host.contains(":"): AF_INET6 else: AF_INET
+proc isIpLiteral(host: string): bool =
+  if host.contains(":"): return true
+  let parts = host.split('.')
+  if parts.len != 4: return false
+  for p in parts:
+    try:
+      let v = parseInt(p)
+      if v < 0 or v > 255: return false
+    except ValueError:
+      return false
+  true
+
+proc resolveProxyHost(server: ProxyServer, host: string): string =
+  ## SOCKS5h/HTTP CONNECT domain names are resolved against the configured
+  ## Yggdrasil hosts file before falling back to the OS resolver.
+  if host.isIpLiteral(): return host
+  try:
+    let hosts = loadHostsFile(server.cfg.hostsFile)
+    let hit = hosts.resolve(host)
+    if hit.isSome: return $hit.get()
+  except CatchableError:
+    discard
+  host
+
+proc connectDirect(server: ProxyServer, host: string, port: int): Socket =
+  let resolved = resolveProxyHost(server, host)
+  let domain = if resolved.contains(":"): AF_INET6 else: AF_INET
   result = newSocket(domain = domain, buffered = false)
   try:
-    result.connect(host, Port(port), timeout = 10000)
+    result.connect(resolved, Port(port), timeout = 10000)
   except CatchableError:
     result.close()
     raise
@@ -179,7 +206,7 @@ proc handleSocks5(server: ProxyServer, client: Socket, hello: string) =
     let port = (byteAt(p, 0) shl 8) or byteAt(p, 1)
 
     try:
-      target = connectDirect(host, port)
+      target = connectDirect(server, host, port)
     except CatchableError:
       client.sendSocksReply(0x05'u8)
       return
@@ -231,7 +258,7 @@ proc handleHttpConnect(server: ProxyServer, client: Socket, line: string) =
         host = targetStr
 
     try:
-      target = connectDirect(host, port)
+      target = connectDirect(server, host, port)
     except CatchableError:
       client.send("HTTP/1.1 502 Bad Gateway\r\n\r\n")
       return

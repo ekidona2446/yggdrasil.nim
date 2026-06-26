@@ -1,4 +1,4 @@
-## Minimal Ironwood pathfinder state.
+## Ironwood pathfinder state.
 ##
 ## Tracks pending lookup rumors and verified PathNotify results. Rumors are
 ## indexed by the bloom-transformed key (matching Go ironwood's behavior), so a

@@ -28,7 +28,6 @@ proc hash*(id: NodeId): Hash =
   for b in id.bytes: h = h !& hash(int(b))
   result = !$h
 proc nodeIdFromHex*(s: string): NodeId = NodeId(bytes: bytes32FromHex(s))
-proc toHex*(id: NodeId): string = toHex(id.bytes)
 proc short*(id: NodeId): string =
   const Digits = "0123456789abcdef"
   result = ""

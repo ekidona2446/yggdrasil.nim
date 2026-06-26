@@ -519,31 +519,30 @@ proc addDnsUpstreamsToConfig*(path: string; servers: seq[string]) =
 
 proc writeGeneratedConfig*(path: string; peers: seq[PublicPeer]; listen: string; keyfile: string;
                            tunEnable, proxyEnable: bool) =
+  ## Write a complete, portable TOML config.  Do not hard-code Linux-only TUN
+  ## names/admin sockets here: defaultConfig() already selects platform defaults
+  ## for Linux, macOS, Windows and other targets at compile time.
   var cfg = defaultConfig()
   cfg.node.keyfile = keyfile
   cfg.node.name = "generated-node"
-  cfg.peers.staticPeers = newSeq[string]()
+  cfg.node.nodeInfo["implementation"] = "yggdrasil.nim"
+  cfg.peers.staticPeers = @[]
   for p in peers: cfg.peers.staticPeers.add(p.uri)
   cfg.peers.multicast = false
   cfg.peers.peerExchange = true
   cfg.peers.publicPeerLists = @[DefaultPublicPeersUrl]
   cfg.tun.enable = tunEnable
-  cfg.tun.name = "ygg0"
-  cfg.tun.mtu = 65535
+  # Keep cfg.tun.name/cfg.tun.mtu from platformDefaults().
   cfg.proxy.enable = proxyEnable
   cfg.proxy.listen = listen
   cfg.proxy.socks5 = true
   cfg.proxy.http = true
   cfg.dns.enable = true
-  cfg.dns.listen = "[::1]:5053"
   cfg.dns.hostsFile = "hosts"
-  cfg.dns.upstream = @["1.1.1.1:53", "8.8.8.8:53"]
-  cfg.admin.listen = @["tcp://127.0.0.1:9001"]
+  if cfg.dns.upstream.len == 0:
+    cfg.dns.upstream = @["1.1.1.1:53", "8.8.8.8:53"]
   cfg.admin.keepalive = true
   cfg.crypto.postQuantum = false
-  cfg.crypto.kem = "ML-KEM-1024"
-  cfg.crypto.identityCertificate = "Dilithium5+Ed25519"
-  cfg.crypto.aead = "ChaCha20-Poly1305"
   cfg.crypto.perHopProtection = false
   writeFile(path, generateConfigToml(cfg))
 
