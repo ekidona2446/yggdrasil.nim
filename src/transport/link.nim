@@ -8,7 +8,6 @@
 import std/[net, strutils, times, options]
 import ../core/[types, peermanager]
 import ../crypto/sodium
-import ../util/bytes as ubytes
 import ../util/ipnet as yipnet
 import ./wire
 import ./router

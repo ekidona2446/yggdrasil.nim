@@ -25,7 +25,6 @@ import ./dns/localdns
 import ./transport/proxy
 import ./transport/peerquic
 import ./tun/tunadapter
-import ./util/bytes as ubytes
 
 const Version* = "0.0.1"
 
@@ -56,10 +55,7 @@ proc tunToOverlay(tun: TunAdapter, pc: PacketConn) {.async.} =
       else:
         continue
 
-      var framed = newSeq[byte](packet.len + 1)
-      framed[0] = 0x00'u8   # typeSessionTraffic, matches Go ironwood
-      for i in 0 ..< packet.len: framed[1 + i] = packet[i]
-      await pc.writeTo(destKey, framed)
+      await pc.writeTo(destKey, packet)
     except CancelledError:
       break
     except CatchableError as e:
@@ -68,19 +64,13 @@ proc tunToOverlay(tun: TunAdapter, pc: PacketConn) {.async.} =
 
 proc overlayToTun(pc: PacketConn, tun: TunAdapter) {.async.} =
   ## Read deliveries from PacketConn, write to TUN.
-  ## Strips typeSessionTraffic (0x00) prefix before writing to TUN.
   var buf = newSeq[byte](65536)
   while tun.running:
     try:
       let (n, source) = await pc.readFrom(addr buf[0], buf.len)
       if n == 0: continue
-      var offset = 0
-      if n > 0 and buf[0] == 0x00'u8:
-        offset = 1
-      let pktLen = n - offset
-      if pktLen <= 0: continue
-      stderr.writeLine "[dataplane] overlay -> TUN src=" & short(source) & " n=" & $pktLen
-      await tun.writePacket(buf[offset ..< n])
+      stderr.writeLine "[dataplane] overlay -> TUN src=" & short(source) & " n=" & $n
+      await tun.writePacket(buf[0 ..< n])
     except CancelledError:
       break
     except CatchableError as e:

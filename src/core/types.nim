@@ -1,7 +1,7 @@
 ## Shared protocol types.
 import std/[hashes, strutils, sequtils]
 import ../util/bytes
-export Bytes32, Bytes16, toHex, fromHex, bytes32FromHex
+export Bytes32, Bytes16, toHex
 
 type
   NodeId* = object
@@ -34,6 +34,7 @@ proc short*(id: NodeId): string =
   for i in 0 ..< 6:
     result.add Digits[int((id.bytes[i] shr 4) and 0x0f)]
     result.add Digits[int(id.bytes[i] and 0x0f)]
+proc toHex*(id: NodeId): string = toHex(id.bytes)
 proc `$`*(id: NodeId): string = toHex(id)
 proc xorDistance*(a, b: NodeId): Bytes32 =
   for i in 0 ..< 32: result[i] = a.bytes[i] xor b.bytes[i]

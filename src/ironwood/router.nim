@@ -4,7 +4,8 @@
 ## signature-compatible pieces needed by the peer layer: SigReq/SigRes signing,
 ## RouterAnnounce creation/verification, and PathNotifyInfo signing.
 
-import std/[os, strutils]
+import std/os
+import std/strutils except fromHex, toHex
 import ../core/types
 import ../crypto/sodium
 import ../util/bytes
