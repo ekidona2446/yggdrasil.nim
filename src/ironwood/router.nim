@@ -34,7 +34,7 @@ proc toArr64*(a: Signature64): array[64, byte] =
   for i in 0 ..< 64: result[i] = a[i]
 
 proc routerCryptoFromEd25519*(sk: Ed25519SecretKey): RouterCrypto =
-  ## Monocypher/Ed25519 secret key layout is seed || public key (64 bytes).
+  ## Ed25519 secret key layout is seed || public key (64 bytes).
   result.secretKey = sk
   for i in 0 ..< 32: result.publicKey.bytes[i] = sk[32 + i]
 
@@ -43,7 +43,7 @@ proc newRouterCrypto*(): RouterCrypto =
   routerCryptoFromEd25519(kp.sk)
 
 proc saveRouterCrypto*(path: string; crypto: RouterCrypto) =
-  writeFile(path, "# yggdrasil.nim Ed25519/Monocypher key\nsecretKey=" & toHex(crypto.secretKey) & "\n")
+  writeFile(path, "# yggdrasil.nim Ed25519 key\nsecretKey=" & toHex(crypto.secretKey) & "\n")
 
 proc loadOrCreateRouterCrypto*(path: string): RouterCrypto =
   if fileExists(path):
