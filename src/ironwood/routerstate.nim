@@ -124,16 +124,25 @@ proc updateAnnounce*(r: var RouterState, ann: RouterAnnounce): bool =
   ## CRDT ordering compatible with yggdrasil-go/Yggdrasil-ng: newer seq wins;
   ## for equal seq, lexicographically smaller parent wins; for equal parent,
   ## larger nonce wins. Accepted updates invalidate coordinate cache.
-  if not ann.check(): return false
+  let checkOk = ann.check()
+  if not checkOk:
+    stderr.writeLine "[ironwood] updateAnnounce CHECK FAILED key=" & short(ann.key) & " seq=" & $ann.seq & " port=" & $ann.port
+    return false
   if r.announces.hasKey(ann.key):
     let old = r.announces[ann.key]
-    if old.seq > ann.seq: return false
+    if old.seq > ann.seq:
+      stderr.writeLine "[ironwood] updateAnnounce REJECTED: old seq " & $old.seq & " > new seq " & $ann.seq & " key=" & short(ann.key)
+      return false
     if old.seq == ann.seq:
       let pc = cmpNodeId(old.parent, ann.parent)
-      if pc < 0: return false
+      if pc < 0:
+        stderr.writeLine "[ironwood] updateAnnounce REJECTED: same seq=" & $ann.seq & " old parent wins key=" & short(ann.key)
+        return false
       # CRDT tie-break (must match yggdrasil-go network/router._update):
       # for equal seq and equal parent, the *lower* nonce wins.
-      if pc == 0 and ann.nonce >= old.nonce: return false
+      if pc == 0 and ann.nonce >= old.nonce:
+        stderr.writeLine "[ironwood] updateAnnounce REJECTED: same seq=" & $ann.seq & " same parent, old nonce=" & $old.nonce & " new nonce=" & $ann.nonce & " key=" & short(ann.key)
+        return false
   r.announces[ann.key] = ann
   r.infoTimes[ann.key] = getTime()
   r.coordsCache.clear()
@@ -243,7 +252,7 @@ proc addPeer*(r: var RouterState, remoteKey: NodeId, priority: uint8 = 0): Route
   r.keyMap[peerPartial] = remoteKey
   result.addEvent(rePeerAdded, "port=" & $port, some(id), some(remoteKey))
   result.outbound.add r.peers[id].action(makeKeepAlive())
-  # SigReq seq MUST be announces[selfKey].seq + 1, matching Go ironwood's _newReq
+  # Send SigReq to the new peer (makeSigReq records lastSigReqSeq/Nonce internally).
   let sigReqSeq = r.announces[r.crypto.publicKey].seq + 1
   stderr.writeLine "[ironwood] addPeer key=" & toHex(remoteKey) & " port=" & $port & " sigReqSeq=" & $sigReqSeq
   result.outbound.add r.peers[id].action(r.peers[id].makeSigReq(sigReqSeq, randomNonce()))
@@ -268,27 +277,38 @@ proc bestPeerForKey(r: var RouterState, key: NodeId): Option[PeerId] =
 proc routeSessionData*(r: var RouterState, dest: NodeId, data: seq[byte], step: var RouterStep) =
   ## Route session traffic to the next hop using the path from pathfinder
   ## (learned via PathNotify) or announce table, whichever is available.
+  let selfCoords = r.cachedCoords(r.crypto.publicKey)
   let pathOpt = r.pathfinder.getPath(dest)
   if pathOpt.isSome:
     ## We have a path from PathNotify — use greedy lookup on it.
     let path = pathOpt.get()
-    var watermark = high(uint64)
+    # Compute OUR distance to the destination first (this is the watermark we
+    # put in the traffic frame — the next hop must be strictly closer).
+    let selfDist = r.distanceToKey(path, r.crypto.publicKey)
+    var watermark = selfDist
     let gp = r.greedyLookup(path, watermark)
     if gp.isSome:
       let p = r.peers[gp.get()]
-      let tr = Traffic(path: path, fromPath: r.cachedCoords(r.crypto.publicKey), source: r.crypto.publicKey,
-                       dest: dest, watermark: watermark, payload: data)
-      stderr.writeLine "[ironwood] routeSessionData dest=" & toHex(dest) & " via peer=" & short(p.remoteKey) & " pathLen=" & $path.len & " (pathfinder)"
+      # watermark is now updated to the best peer's distance by greedyLookup.
+      # But we need to send selfDist as the watermark in the frame, because
+      # the watermark is the distance from the PREVIOUS hop to the destination.
+      # The next hop will update it to its own distance when it forwards.
+      let tr = Traffic(path: path, fromPath: selfCoords, source: r.crypto.publicKey,
+                       dest: dest, watermark: selfDist, payload: data)
+      stderr.writeLine "[ironwood] routeSessionData dest=" & short(dest) & " via peer=" & short(p.remoteKey) & " path=[" & coordToString(path) & "] self=[" & coordToString(selfCoords) & "] selfDist=" & $selfDist & " (pathfinder)"
       step.outbound.add p.action(encodeTrafficFrame(tr))
       return
   ## Fall back to announce-table based routing.
   let pid = r.bestPeerForKey(dest)
   if pid.isSome:
     let p = r.peers[pid.get()]
-    let path2 = pathOpt.get(r.cachedCoords(dest))
-    let tr = Traffic(path: path2, fromPath: r.cachedCoords(r.crypto.publicKey), source: r.crypto.publicKey,
-                     dest: dest, watermark: high(uint64), payload: data)
-    stderr.writeLine "[ironwood] routeSessionData dest=" & toHex(dest) & " via peer=" & short(p.remoteKey) & " pathLen=" & $path2.len & " (announce)"
+    let path2 = r.cachedCoords(dest)
+    let selfPath = r.cachedCoords(r.crypto.publicKey)
+    let selfDist = treeDistance(path2, selfPath)
+    stderr.writeLine "[ironwood] routeSessionData dest=" & short(dest) & " path2=[" & coordToString(path2) & "] selfPath=[" & coordToString(selfPath) & "] selfDist=" & $selfDist & " announces=" & $r.announces.len
+    let tr = Traffic(path: path2, fromPath: selfPath, source: r.crypto.publicKey,
+                     dest: dest, watermark: selfDist, payload: data)
+    stderr.writeLine "[ironwood] routeSessionData dest=" & toHex(dest) & " via peer=" & short(p.remoteKey) & " pathLen=" & $path2.len & " selfDist=" & $selfDist & " (announce)"
     step.outbound.add p.action(encodeTrafficFrame(tr))
     return
   step.addEvent(reNoRoute, "session dest=" & toHex(dest), key = some(dest))
@@ -370,14 +390,21 @@ proc responseCost(r: RouterState, parent: NodeId): uint64 =
   r.peerCost(r.peerByKey[parent])
 
 proc adoptParent(r: var RouterState, parent: NodeId, res: SigResFull): bool =
+  # The parent signed bytesForSig(ourKey, parentKey, res.seq, res.nonce, res.port).
+  # We MUST use exactly res.seq/res.nonce/res.port — any change would invalidate
+  # the parent's signature in ann.check().
   let ann = makeChildAnnounce(r.crypto, parent, res.seq, res.nonce, res.port, res.parentSignature.toSig64())
   let ok = r.updateAnnounce(ann)
+  if ok:
+    # Track the seq so future SigReqs use at least seq+1
+    r.ownSeq = max(r.ownSeq, res.seq + 1)
   stderr.writeLine "[ironwood] adoptParent parent=" & short(parent) & " seq=" & $res.seq & " port=" & $res.port & " accepted=" & $ok
   ok
 
 proc becomeRoot(r: var RouterState): bool =
-  # Must use announces[selfKey].seq + 1 like Go ironwood's _becomeRoot
-  let newSeq = r.announces[r.crypto.publicKey].seq + 1
+  # Use the maximum of ownSeq and stored seq+1 to avoid going backwards.
+  let newSeq = max(r.ownSeq, r.announces[r.crypto.publicKey].seq + 1)
+  r.ownSeq = newSeq + 1
   let ann = makeRootAnnounce(r.crypto, newSeq, randomNonce())
   let ok = r.updateAnnounce(ann)
   stderr.writeLine "[ironwood] becomeRoot seq=" & $newSeq & " accepted=" & $ok
@@ -473,17 +500,21 @@ proc fixParent*(r: var RouterState): RouterStep =
       result.outbound.add p.action(announceFrame(ann))
       r.markAnnounceSent(pid, selfKey)
 
-proc maintenanceSigReqs*(r: var RouterState): seq[FrameAction] =
+proc sendReqs*(r: var RouterState): seq[FrameAction] =
+  ## Send new SigReq to all peers, clearing old request/response state.
+  ## Called only when needed: on peer add, on parent/root change, on refresh.
+  ## Matches Go ironwood's _sendReqs.
   r.responses.clear()
-  # SigReq seq MUST be announces[selfKey].seq + 1, matching Go ironwood's _newReq
   let sigReqSeq = r.announces[r.crypto.publicKey].seq + 1
   for _, p in r.peers.mpairs:
     result.add p.action(p.makeSigReq(sigReqSeq, randomNonce()))
 
 proc maintenance*(r: var RouterState): RouterStep =
-  ## Periodic orchestrator tick. Sends SigReq refreshes, runs parent/root
-  ## selection, recomputes on-tree bloom state, refreshes blooms, and gossips
-  ## known announcements that have not yet been sent to each peer.
+  ## Periodic orchestrator tick. Runs parent/root selection, recomputes
+  ## on-tree bloom state, refreshes blooms, and gossips known announcements.
+  ## SigReqs are only sent when something actually changed (parent switch,
+  ## root change, periodic refresh), matching Go ironwood's behavior where
+  ## _sendReqs is called from _fix only when a change occurs.
   if int((getTime() - r.lastRefresh).inSeconds) >= r.routerRefreshSeconds:
     r.refresh = true
     r.lastRefresh = getTime()
@@ -494,6 +525,12 @@ proc maintenance*(r: var RouterState): RouterStep =
   result.outbound.add fix.outbound
   result.events.add fix.events
 
+  # If fixParent triggered a change (adopted new parent, became root, or
+  # refresh was processed), send new SigReqs to all peers.
+  let changed = fix.events.len > 0
+  if changed:
+    result.outbound.add r.sendReqs()
+
   var parentMap = initTable[NodeId, NodeId]()
   for key, ann in r.announces: parentMap[key] = ann.parent
   let selfParent = r.currentParent()
@@ -502,7 +539,6 @@ proc maintenance*(r: var RouterState): RouterStep =
       let pid = r.peerByKey[item.peer]
       result.outbound.add r.peers[pid].action(encodeFrame(iwProtoBloomFilter, item.filter.encode()))
 
-  result.outbound.add r.maintenanceSigReqs()
   for pid, p in r.peers.mpairs:
     let bf = r.blooms.getBloomFor(p.remoteKey, r.crypto.publicKey)
     result.outbound.add p.action(encodeFrame(iwProtoBloomFilter, bf.encode()))
@@ -533,7 +569,9 @@ proc sendAppData*(r: var RouterState, dest: NodeId, data: openArray[byte]): Rout
 
 proc handleTraffic(r: var RouterState, tr: Traffic, step: var RouterStep) =
   if tr.dest == r.crypto.publicKey:
+    stderr.writeLine "[ironwood] handleTraffic FOR US src=" & short(tr.source) & " payloadLen=" & $tr.payload.len & " firstByte=" & (if tr.payload.len > 0: $tr.payload[0] else: "empty")
     let acts = r.sessions.handleData(toEdPublic(tr.source), tr.payload)
+    stderr.writeLine "[ironwood] handleData returned " & $acts.len & " actions"
     for a in acts:
       case a.kind
       of oaDeliver:
@@ -577,25 +615,30 @@ proc handleFrame*(r: var RouterState, peerId: PeerId, frame: Frame): RouterStep 
     let a = decodeAnnounce(frame.payload)
     if a.isSome:
       let ann = fromWireAnnounce(a.get())
-      let accepted = r.updateAnnounce(ann)
-      stderr.writeLine "[ironwood] announce key=" & toHex(ann.key) & " parent=" & toHex(ann.parent) & " seq=" & $ann.seq & " port=" & $ann.port & " accepted=" & $accepted
-      if accepted:
-        if ann.key == r.crypto.publicKey:
-          # We accepted an announce for our OWN key from a peer. That means our
-          # seq was lower than what the peer remembered (e.g. we just restarted
-          # and lost our sequence counter). Force an immediate refresh so we
-          # re-run root/parent selection and re-announce with seq+1, overriding
-          # the stale info. Mirrors yggdrasil-go network/router._handleAnnounce.
-          r.refresh = true
-          r.doRoot1 = false
-          r.doRoot2 = true
-        r.blooms.setOnTree(remoteKey, true)
-        result.addEvent(reAnnounceStored, "parent=" & toHex(ann.parent), some(peerId), some(ann.key))
-        ## Gossip newly accepted announcements to other direct peers.
-        for pid, p in r.peers:
-          if pid != peerId and not r.wasAnnounceSent(pid, ann.key):
-            result.outbound.add p.action(announceFrame(ann))
-            r.markAnnounceSent(pid, ann.key)
+      if ann.key == r.crypto.publicKey:
+        # We received our OWN announce reflected from a peer.  Never store it —
+        # the nonce is always different (maintenance generates a fresh random
+        # nonce each tick), so CRDT comparison would reject the duplicate and
+        # could previously corrupt our own state.  If the reflected seq is
+        # higher than ours (node restart with lost counter), just bump our seq
+        # counter to avoid being stuck with stale routing info.
+        let ownAnn = r.announces.getOrDefault(r.crypto.publicKey)
+        if ann.seq >= ownAnn.seq:
+          # Bump our seq to be strictly higher, matching Go ironwood's
+          # behaviour when it detects a stale self-announce.
+          r.ownSeq = ann.seq + 1
+        stderr.writeLine "[ironwood] announce key=self (skipped, ownSeq=" & $r.ownSeq & ") parent=" & toHex(ann.parent) & " seq=" & $ann.seq & " port=" & $ann.port
+      else:
+        let accepted = r.updateAnnounce(ann)
+        stderr.writeLine "[ironwood] announce key=" & toHex(ann.key) & " parent=" & toHex(ann.parent) & " seq=" & $ann.seq & " port=" & $ann.port & " accepted=" & $accepted
+        if accepted:
+          r.blooms.setOnTree(remoteKey, true)
+          result.addEvent(reAnnounceStored, "parent=" & toHex(ann.parent), some(peerId), some(ann.key))
+          ## Gossip newly accepted announcements to other direct peers.
+          for pid, p in r.peers:
+            if pid != peerId and not r.wasAnnounceSent(pid, ann.key):
+              result.outbound.add p.action(announceFrame(ann))
+              r.markAnnounceSent(pid, ann.key)
   of iwProtoSigRes:
     let sr = decodeSigResFull(frame.payload)
     if sr.isSome:

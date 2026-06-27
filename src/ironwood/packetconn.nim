@@ -36,6 +36,7 @@ type
     maintenanceFut*: Future[void]
     running*: bool
     pathNotifyCb*: PathNotifyCb
+    pendingOutbound*: Table[PeerId, seq[seq[byte]]]  ## buffered frames for peers not yet in pc.peers
 
 proc newPacketConn*(crypto: RouterCrypto): PacketConn =
   result = PacketConn(
@@ -56,6 +57,12 @@ proc dispatchOutbound(pc: PacketConn, step: RouterStep) =
   for action in step.outbound:
     if pc.peers.hasKey(action.peerId):
       pc.peers[action.peerId].sendFrame(action.frame)
+    else:
+      # Peer's AsyncPeer not registered yet (addPeer via channel race).
+      # Buffer the frame; it will be flushed once handleConn creates the peer.
+      if not pc.pendingOutbound.hasKey(action.peerId):
+        pc.pendingOutbound[action.peerId] = @[]
+      pc.pendingOutbound[action.peerId].add(action.frame)
 
 proc dispatchDeliveries(pc: PacketConn, step: RouterStep) =
   for d in step.deliveries:
@@ -94,9 +101,12 @@ proc processRouterMessage(pc: PacketConn, msg: RouterMessage) =
           pc.dispatchDeliveries(step)
           pc.dispatchEvents(step)
       of rmSendTraffic:
-        let step = pc.state.sendAppData(msg.traffic.dest, msg.traffic.payload)
-        pc.dispatchOutbound(step)
-        pc.dispatchDeliveries(step)
+        try:
+          let step = pc.state.sendAppData(msg.traffic.dest, msg.traffic.payload)
+          pc.dispatchOutbound(step)
+          pc.dispatchDeliveries(step)
+        except CatchableError as e:
+          stderr.writeLine "[packetconn] rmSendTraffic error: " & e.msg
       of rmMaintenanceTick:
         let step = pc.state.maintenance()
         pc.dispatchOutbound(step)
@@ -145,6 +155,7 @@ proc readFrom*(pc: PacketConn, buf: ptr byte, bufLen: int): Future[(int, NodeId)
   result = (n, delivery.source)
 
 proc writeTo*(pc: PacketConn, dest: NodeId, data: seq[byte]): Future[void] {.async.} = 
+  stderr.writeLine "[packetconn] writeTo dest=" & short(dest) & " dataLen=" & $data.len
   let msg = RouterMessage(
     kind: rmSendTraffic,
     traffic: Traffic(
@@ -161,16 +172,23 @@ proc writeTo*(pc: PacketConn, dest: NodeId, data: seq[byte]): Future[void] {.asy
 proc handleConn*(pc: PacketConn, peerKey: NodeId, transport: StreamTransport,
                  priority: uint8 = 0): Future[void] {.async.} =
   ## Handle a new or re-connected peer backed by a raw StreamTransport.
+  ## addPeer is done synchronously (single-threaded async is safe) to avoid
+  ## the race where the routerChan consumer hasn't processed the addPeer
+  ## message yet.  The outbound frames from addPeer are dispatched directly.
+  # Register peer synchronously via router channel, then poll for the
+  # peer to appear.  The channel approach avoids Nim's strict exception
+  # tracking with {.async.} while still serializing router state access.
   let addMsg = RouterMessage(kind: rmAddPeer, peerKey: peerKey, priority: priority)
   await pc.routerChan.addLast(addMsg)
   
   var pid: PeerId = 0
-  for attempt in 0 ..< 100:
-    let pidOpt = pc.state.peerIdFor(peerKey)
-    if pidOpt.isSome:
-      pid = pidOpt.get()
-      break
-    await sleepAsync(chronos.milliseconds(20))
+  for attempt in 0 ..< 200:
+    {.cast(gcsafe).}:
+      let pidOpt = pc.state.peerIdFor(peerKey)
+      if pidOpt.isSome:
+        pid = pidOpt.get()
+        break
+    await sleepAsync(chronos.milliseconds(10))
   
   if pid == 0:
     raise newException(ValueError, "peer not registered after addPeer")
@@ -183,6 +201,14 @@ proc handleConn*(pc: PacketConn, peerKey: NodeId, transport: StreamTransport,
   let peer = newAsyncPeer(pid, peerKey, transport, pc.routerChan)
   pc.peers[pid] = peer
   pc.peerByKey[peerKey] = pid
+  # Flush any frames that were buffered before the AsyncPeer existed
+  if pc.pendingOutbound.hasKey(pid):
+    let count = pc.pendingOutbound[pid].len
+    for i, frame in pc.pendingOutbound[pid]:
+      stderr.writeLine "[packetconn] flushing frame[" & $i & "] len=" & $frame.len & " firstBytes=" & (if frame.len >= 2: $frame[0] & "," & $frame[1] else: $frame[0]) & " for peer=" & short(peerKey)
+      peer.sendFrame(frame)
+    pc.pendingOutbound.del(pid)
+    stderr.writeLine "[packetconn] flushed " & $count & " pending frames for peer=" & short(peerKey)
   
   try:
     await peer.run()
@@ -205,12 +231,13 @@ proc handleConnStream*(pc: PacketConn, peerKey: NodeId,
   await pc.routerChan.addLast(addMsg)
   
   var pid: PeerId = 0
-  for attempt in 0 ..< 100:
-    let pidOpt = pc.state.peerIdFor(peerKey)
-    if pidOpt.isSome:
-      pid = pidOpt.get()
-      break
-    await sleepAsync(chronos.milliseconds(20))
+  for attempt in 0 ..< 200:
+    {.cast(gcsafe).}:
+      let pidOpt = pc.state.peerIdFor(peerKey)
+      if pidOpt.isSome:
+        pid = pidOpt.get()
+        break
+    await sleepAsync(chronos.milliseconds(10))
   
   if pid == 0:
     raise newException(ValueError, "peer not registered after addPeer")
@@ -223,6 +250,13 @@ proc handleConnStream*(pc: PacketConn, peerKey: NodeId,
   let peer = newAsyncPeerStream(pid, peerKey, reader, writer, transport, pc.routerChan)
   pc.peers[pid] = peer
   pc.peerByKey[peerKey] = pid
+  # Flush any frames that were buffered before the AsyncPeer existed
+  if pc.pendingOutbound.hasKey(pid):
+    let count = pc.pendingOutbound[pid].len
+    for frame in pc.pendingOutbound[pid]:
+      peer.sendFrame(frame)
+    pc.pendingOutbound.del(pid)
+    stderr.writeLine "[packetconn] flushed " & $count & " pending frames for stream peer=" & short(peerKey)
   
   try:
     await peer.run()

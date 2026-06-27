@@ -49,13 +49,23 @@ proc tunToOverlay(tun: TunAdapter, pc: PacketConn) {.async.} =
           # Not a Yggdrasil unicast address (200::/7 or 300::/7); drop.
           continue
         destKey = keyPrefixForYggAddress(destAddr)
-        stderr.writeLine "[dataplane] TUN -> overlay dest=" & toIPv6String(destAddr) & " pktLen=" & $packet.len
+        stderr.writeLine "[dataplane] TUN -> overlay dest=" & toIPv6String(destAddr) & " pktLen=" & $packet.len & " destAddr0=0x" & toHex(destAddr[0]) & " destKey=" & toHex(destKey)
       elif version == 4 and packet.len >= 20:
         continue
       else:
         continue
 
-      await pc.writeTo(destKey, packet)
+      # Prepend typeSessionTraffic byte (0x00) matching Go's Core.WriteTo.
+      # Go's Core.ReadFrom inspects the first byte to distinguish traffic
+      # (0x00) from protocol messages (0x01); IPv6 packets start with 0x60
+      # and would be silently dropped without the type prefix.
+      var typed: seq[byte]
+      typed.add 0x00'u8
+      for b in packet: typed.add b
+      try:
+        await pc.writeTo(destKey, typed)
+      except CatchableError as e:
+        stderr.writeLine "[dataplane] writeTo error: " & e.msg
     except CancelledError:
       break
     except CatchableError as e:
@@ -64,13 +74,19 @@ proc tunToOverlay(tun: TunAdapter, pc: PacketConn) {.async.} =
 
 proc overlayToTun(pc: PacketConn, tun: TunAdapter) {.async.} =
   ## Read deliveries from PacketConn, write to TUN.
+  ## Strips the typeSessionTraffic/typeSessionProto prefix byte that Go's
+  ## Core.ReadFrom adds; only typeSessionTraffic (0x00) data is forwarded
+  ## to the TUN as an IPv6 packet.
   var buf = newSeq[byte](65536)
   while tun.running:
     try:
       let (n, source) = await pc.readFrom(addr buf[0], buf.len)
       if n == 0: continue
-      stderr.writeLine "[dataplane] overlay -> TUN src=" & short(source) & " n=" & $n
-      await tun.writePacket(buf[0 ..< n])
+      if buf[0] != 0x00: continue  # skip non-traffic (typeSessionProto etc.)
+      let pktLen = n - 1
+      if pktLen == 0: continue
+      stderr.writeLine "[dataplane] overlay -> TUN src=" & short(source) & " n=" & $pktLen
+      await tun.writePacket(buf[1 ..< n])
     except CancelledError:
       break
     except CatchableError as e:
