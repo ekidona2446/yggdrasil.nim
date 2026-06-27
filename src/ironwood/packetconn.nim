@@ -116,36 +116,77 @@ proc processRouterMessage(pc: PacketConn, msg: RouterMessage) =
         pc.state.doRoot1 = true
         pc.state.doRoot2 = true
         pc.state.lastRefresh = getTime() - initDuration(seconds = RouterRefreshSeconds)
-    except CatchableError:
-      discard
+    except CatchableError as e:
+      stderr.writeLine "[packetconn] processRouterMessage FATAL: " & e.msg & " kind=" & $msg.kind
+
+proc drainChannel(pc: PacketConn) =
+  ## Process all pending messages in routerChan (non-blocking).
+  while true:
+    try:
+      let msg = pc.routerChan.popFirstNoWait()
+      try:
+        pc.processRouterMessage(msg)
+      except CatchableError as e:
+        stderr.writeLine "[packetconn] drainChannel processMsg error: " & e.msg
+    except AsyncQueueEmptyError:
+      break
 
 proc routerActorLoop(pc: PacketConn) {.async.} =
+  ## Main router actor loop. Processes messages from routerChan and
+  ## periodic maintenance ticks.
+  ##
+  ## Critical: we must NOT abandon a popFirst() future, because chronos
+  ## AsyncQueue registers a getter callback for each popFirst() call.
+  ## If we call popFirst() again while a previous call is still pending,
+  ## the old getter consumes the next message and it is lost forever.
+  ## Fix: reuse the pending recvFut across iterations when sleepFut wins race.
   var lastTick = getMonoTime()
+  var pendingRecv: Future[RouterMessage] = nil
+  var tickCount = 0
   while pc.running:
-    let now = getMonoTime()
-    let elapsed = int((now - lastTick).inMilliseconds)
-    let waitMs = max(1, MaintenanceIntervalMs - elapsed)
-    
-    let sleepFut = sleepAsync(chronos.milliseconds(waitMs))
-    let recvFut = pc.routerChan.popFirst()
-    let completed = await race(recvFut, sleepFut)
-    
-    {.cast(gcsafe).}:
-      if completed == recvFut:
-        try:
-          let msg = recvFut.read()
+    try:
+      let now = getMonoTime()
+      let elapsed = int((now - lastTick).inMilliseconds)
+      let waitMs = max(1, MaintenanceIntervalMs - elapsed)
+      
+      # Reuse pending recv from previous iteration (if sleepFut won race),
+      # otherwise create a new one.
+      let recvFut = if pendingRecv != nil: pendingRecv else: pc.routerChan.popFirst()
+      pendingRecv = nil
+      let sleepFut = sleepAsync(chronos.milliseconds(waitMs))
+      let completed = await race(recvFut, sleepFut)
+      
+      {.cast(gcsafe).}:
+        if completed == recvFut:
           try:
-            pc.processRouterMessage(msg)
-          except Exception:
-            discard
-        except CatchableError:
-          discard
-      else:
-        try:
-          pc.processRouterMessage(RouterMessage(kind: rmMaintenanceTick))
-        except Exception:
-          discard
-        lastTick = getMonoTime()
+            let msg = recvFut.read()
+            try:
+              pc.processRouterMessage(msg)
+            except Exception as e:
+              stderr.writeLine "[packetconn] processMsg error: " & e.msg
+          except CatchableError as e:
+            stderr.writeLine "[packetconn] recvFut.read error: " & e.msg
+          # Drain any more messages that queued up
+          try:
+            pc.drainChannel()
+          except Exception as e:
+            stderr.writeLine "[packetconn] drainChannel error: " & e.msg
+          lastTick = getMonoTime()
+        else:
+          # sleepFut won — recvFut is still pending. Save it for next iter
+          # so we don't create a competing popFirst() that would steal messages.
+          pendingRecv = recvFut
+          try:
+            pc.processRouterMessage(RouterMessage(kind: rmMaintenanceTick))
+          except Exception as e:
+            stderr.writeLine "[packetconn] tick error: " & e.msg
+          inc tickCount
+          if tickCount mod 10 == 0:
+            stderr.writeLine "[packetconn] actor loop alive, tick=" & $tickCount & " keyMap=" & $pc.state.keyMap.len & " announces=" & $pc.state.announces.len & " peers=" & $pc.state.peers.len & " pendingRecv=" & $(pendingRecv != nil)
+          lastTick = getMonoTime()
+    except CatchableError as e:
+      stderr.writeLine "[packetconn] actorLoop outer error: " & e.msg
+      await sleepAsync(chronos.milliseconds(100))
 
 proc readFrom*(pc: PacketConn, buf: ptr byte, bufLen: int): Future[(int, NodeId)] {.async.} =
   let delivery = await pc.deliveryQueue.popFirst()

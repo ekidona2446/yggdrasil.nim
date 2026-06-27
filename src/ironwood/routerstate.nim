@@ -279,6 +279,10 @@ proc routeSessionData*(r: var RouterState, dest: NodeId, data: seq[byte], step: 
   ## (learned via PathNotify) or announce table, whichever is available.
   let selfCoords = r.cachedCoords(r.crypto.publicKey)
   let pathOpt = r.pathfinder.getPath(dest)
+  stderr.writeLine "[ironwood] routeSessionData dest=" & toHex(dest) & " pathfinderHasPath=" & $pathOpt.isSome & " pathfinderPaths=" & $r.pathfinder.paths.len & " pathfinderKeys="
+  for k in r.pathfinder.paths.keys:
+    stderr.write " " & short(k)
+  stderr.writeLine ""
   if pathOpt.isSome:
     ## We have a path from PathNotify — use greedy lookup on it.
     let path = pathOpt.get()
@@ -553,15 +557,22 @@ proc maintenance*(r: var RouterState): RouterStep =
 proc sendAppData*(r: var RouterState, dest: NodeId, data: openArray[byte]): RouterStep =
   ## Resolve a partial/transformed key to the full key if possible (like Go's
   ## keyStore), then attempt to route the traffic.
+  ## 
+  ## Go's keyStore maps IPv6-derived partial keys to full Ed25519 public keys.
+  ## It buffers packets when the mapping is unknown and sends a PathLookup.
+  ## When PathNotify arrives (via SetPathNotify callback), the mapping is stored
+  ## and buffered packets are flushed.
   let actualDest = if r.keyMap.hasKey(dest): r.keyMap[dest] else: dest
   let resolved = r.keyMap.hasKey(dest)
-  if not r.pathfinder.hasPath(actualDest) and not r.peerByKey.hasKey(actualDest):
-    stderr.writeLine "[ironwood] sendAppData dest=" & toHex(dest) & " actualDest=" & toHex(actualDest) & " resolved=" & $resolved & " keyMapSize=" & $r.keyMap.len & " no path, sending lookup"
-    result = r.sendLookup(dest)
+  let hasPath = r.pathfinder.hasPath(actualDest)
+  let isDirectPeer = r.peerByKey.hasKey(actualDest)
+  if not hasPath and not isDirectPeer:
+    stderr.writeLine "[ironwood] sendAppData dest=" & short(dest) & " actualDest=" & short(actualDest) & " resolved=" & $resolved & " hasPath=" & $hasPath & " isDirectPeer=" & $isDirectPeer & " keyMapSize=" & $r.keyMap.len & " no path, sending lookup"
+    result = r.sendLookup(actualDest)
     result.addEvent(reNoRoute, "queued lookup before app data", key = some(dest))
     return
   let actions = r.sessions.writeTo(toEdPublic(actualDest), data)
-  stderr.writeLine "[ironwood] sendAppData dest=" & toHex(dest) & " actualDest=" & toHex(actualDest) & " resolved=" & $resolved & " keyMapSize=" & $r.keyMap.len & " sessionActions=" & $actions.len & " dataLen=" & $data.len
+  stderr.writeLine "[ironwood] sendAppData dest=" & short(dest) & " actualDest=" & short(actualDest) & " resolved=" & $resolved & " keyMapSize=" & $r.keyMap.len & " sessionActions=" & $actions.len & " dataLen=" & $data.len
   for a in actions:
     case a.kind
     of oaSendToInner: r.routeSessionData(toNodeId(a.dest), a.data, result)
@@ -569,9 +580,11 @@ proc sendAppData*(r: var RouterState, dest: NodeId, data: openArray[byte]): Rout
 
 proc handleTraffic(r: var RouterState, tr: Traffic, step: var RouterStep) =
   if tr.dest == r.crypto.publicKey:
-    stderr.writeLine "[ironwood] handleTraffic FOR US src=" & short(tr.source) & " payloadLen=" & $tr.payload.len & " firstByte=" & (if tr.payload.len > 0: $tr.payload[0] else: "empty")
+    stderr.writeLine "[ironwood] handleTraffic FOR US src=" & short(tr.source) & " payloadLen=" & $tr.payload.len & " firstByte=" & (if tr.payload.len > 0: "0x" & toHex(tr.payload[0]) else: "empty") & " fullPayload=" & toHex(tr.payload)
     let acts = r.sessions.handleData(toEdPublic(tr.source), tr.payload)
     stderr.writeLine "[ironwood] handleData returned " & $acts.len & " actions"
+    for i, a in acts:
+      stderr.writeLine "[ironwood]   action[" & $i & "] kind=" & $a.kind & " dataLen=" & $a.data.len
     for a in acts:
       case a.kind
       of oaDeliver:
@@ -630,9 +643,18 @@ proc handleFrame*(r: var RouterState, peerId: PeerId, frame: Frame): RouterStep 
         stderr.writeLine "[ironwood] announce key=self (skipped, ownSeq=" & $r.ownSeq & ") parent=" & toHex(ann.parent) & " seq=" & $ann.seq & " port=" & $ann.port
       else:
         let accepted = r.updateAnnounce(ann)
-        stderr.writeLine "[ironwood] announce key=" & toHex(ann.key) & " parent=" & toHex(ann.parent) & " seq=" & $ann.seq & " port=" & $ann.port & " accepted=" & $accepted
+        stderr.writeLine "[ironwood] announce key=" & short(ann.key) & " parent=" & short(ann.parent) & " seq=" & $ann.seq & " port=" & $ann.port & " accepted=" & $accepted
         if accepted:
           r.blooms.setOnTree(remoteKey, true)
+          ## Populate keyMap: derive the partial key from the announced node's
+          ## IPv6 address and map it to the full public key. This mirrors Go's
+          ## keyStore.update() which is called from SetPathNotify. Without this,
+          ## TUN packets destined for this node can't resolve the partial key
+          ## (derived from the dest IPv6 address) to the full Ed25519 key
+          ## needed for encrypted session routing.
+          let annAddr = deriveYggAddress(ann.key)
+          let annPartial = keyPrefixForYggAddress(annAddr)
+          r.keyMap[annPartial] = ann.key
           result.addEvent(reAnnounceStored, "parent=" & toHex(ann.parent), some(peerId), some(ann.key))
           ## Gossip newly accepted announcements to other direct peers.
           for pid, p in r.peers:
