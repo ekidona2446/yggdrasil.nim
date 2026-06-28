@@ -199,7 +199,7 @@ proc writeTo*(pc: PacketConn, dest: NodeId, data: seq[byte]): Future[void] {.asy
   stderr.writeLine "[packetconn] writeTo dest=" & short(dest) & " dataLen=" & $data.len
   let msg = RouterMessage(
     kind: rmSendTraffic,
-    traffic: Traffic(
+    traffic: TrafficPacket(
       path: @[], fromPath: @[],
       source: pc.crypto.publicKey, dest: dest,
       watermark: high(uint64), payload: data,

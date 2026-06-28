@@ -58,7 +58,7 @@ proc initIronwoodPeer*(id: PeerId, remoteKey: NodeId, crypto: RouterCrypto,
 proc addEvent(step: var PeerStep, kind: PeerEventKind, detail = "") =
   step.events.add PeerEvent(kind: kind, detail: detail)
 
-proc makeKeepAlive*(): seq[byte] = encodeFrame(iwKeepAlive, [])
+proc makeKeepAlive*(): seq[byte] = encodeFrame(KeepAlive, [])
 
 proc makeSigReq*(p: var IronwoodPeer, seq: uint64, nonce: uint64): seq[byte] =
   ## Create a SigReq frame with the given seq and nonce.
@@ -66,15 +66,15 @@ proc makeSigReq*(p: var IronwoodPeer, seq: uint64, nonce: uint64): seq[byte] =
   p.lastSigReqSeq = seq
   p.lastSigReqNonce = nonce
   p.rtt.markSigReqSent(p.id)
-  encodeFrame(iwProtoSigReq, encodeSigReq(SigReq(seq: seq, nonce: nonce)))
+  encodeFrame(ProtoSigReq, encodeSigReq(SigReq(seq: seq, nonce: nonce)))
 
 proc makePathLookup*(p: IronwoodPeer, dest: NodeId, fromPath: Path = @[]): seq[byte] =
-  encodeFrame(iwProtoPathLookup, encodePathLookup(PathLookup(source: p.crypto.publicKey, dest: dest, fromPath: fromPath)))
+  encodeFrame(ProtoPathLookup, encodePathLookup(PathLookup(source: p.crypto.publicKey, dest: dest, fromPath: fromPath)))
 
 proc handleSigReq(p: IronwoodPeer, req: SigReq): seq[byte] =
   let sig = p.crypto.signSigRes(p.remoteKey, p.crypto.publicKey, req.seq, req.nonce, p.localPort)
   let res = SigResFull(seq: req.seq, nonce: req.nonce, port: p.localPort, parentSignature: sig)
-  encodeFrame(iwProtoSigRes, encodeSigResFull(res))
+  encodeFrame(ProtoSigRes, encodeSigResFull(res))
 
 proc handleSigRes(p: var IronwoodPeer, res: SigResFull, step: var PeerStep) =
   p.remotePort = res.port
@@ -82,7 +82,7 @@ proc handleSigRes(p: var IronwoodPeer, res: SigResFull, step: var PeerStep) =
   if res.seq == p.lastSigReqSeq and res.nonce == p.lastSigReqNonce:
     ev.rttMs = p.rtt.handleSigResReceived(p.id)
     let ann = makeChildAnnounce(p.crypto, p.remoteKey, res.seq, res.nonce, res.port, res.parentSignature.toSig64())
-    step.outbound.add encodeFrame(iwProtoAnnounce, encodeAnnounce(ann.toWire()))
+    step.outbound.add encodeFrame(ProtoAnnounce, encodeAnnounce(ann.toWire()))
   step.events.add ev
 
 proc handleAnnounce(p: var IronwoodPeer, payload: openArray[byte], step: var PeerStep) =
@@ -99,24 +99,24 @@ proc handleAnnounce(p: var IronwoodPeer, payload: openArray[byte], step: var Pee
 
 proc handleFrame*(p: var IronwoodPeer, frame: Frame): PeerStep =
   case frame.packetType
-  of iwKeepAlive:
+  of KeepAlive:
     result.addEvent(peKeepAlive)
-  of iwProtoSigReq:
+  of ProtoSigReq:
     let req = decodeSigReq(frame.payload)
     if req.isNone:
       result.addEvent(peDecodeError, "bad sigreq")
     else:
       result.events.add PeerEvent(kind: peSigReqReceived, detail: "seq=" & $req.get().seq)
       result.outbound.add p.handleSigReq(req.get())
-  of iwProtoSigRes:
+  of ProtoSigRes:
     let res = decodeSigResFull(frame.payload)
     if res.isNone:
       result.addEvent(peDecodeError, "bad sigres")
     else:
       p.handleSigRes(res.get().value, result)
-  of iwProtoAnnounce:
+  of ProtoAnnounce:
     p.handleAnnounce(frame.payload, result)
-  of iwProtoBloomFilter:
+  of ProtoBloomFilter:
     let b = decodeBloom(frame.payload)
     if b.isNone:
       result.addEvent(peDecodeError, "bad bloom")
@@ -124,25 +124,25 @@ proc handleFrame*(p: var IronwoodPeer, frame: Frame): PeerStep =
       p.bloom = b.get()
       p.haveBloom = true
       result.addEvent(peBloomReceived)
-  of iwProtoPathLookup:
+  of ProtoPathLookup:
     let l = decodePathLookup(frame.payload)
     if l.isNone:
       result.addEvent(peDecodeError, "bad pathlookup")
     else:
       result.addEvent(pePathNotifyReceived, "lookup source=" & short(l.get().source) & " dest=" & short(l.get().dest))
-  of iwProtoPathNotify:
+  of ProtoPathNotify:
     let n = decodePathNotify(frame.payload)
     if n.isNone:
       result.addEvent(peDecodeError, "bad pathnotify")
     else:
       result.events.add PeerEvent(kind: pePathNotifyReceived, pathSource: some(n.get().source), pathDest: some(n.get().dest), detail: "pathLen=" & $n.get().path.len)
-  of iwProtoPathBroken:
+  of ProtoPathBroken:
     let b = decodePathBroken(frame.payload)
     if b.isNone:
       result.addEvent(peDecodeError, "bad pathbroken")
     else:
       result.events.add PeerEvent(kind: pePathBrokenReceived, pathSource: some(b.get().source), pathDest: some(b.get().dest), detail: "pathLen=" & $b.get().path.len)
-  of iwDummy, iwTraffic:
+  of Dummy, Traffic:
     discard
 
 proc handleFrameBytes*(p: var IronwoodPeer, data: openArray[byte]): PeerStep =

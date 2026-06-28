@@ -121,7 +121,7 @@ proc readerLoop(peer: AsyncPeer) {.async.} =
   while peer.running:
     try:
       let frame = await readFrameFromReader(peer.reader)
-      if frame.packetType in {iwProtoPathBroken, iwTraffic}:
+      if frame.packetType in {ProtoPathBroken, Traffic}:
         stderr.writeLine "[asyncpeer] recv peer=" & short(peer.remoteKey) & " type=" & $frame.packetType & " payloadLen=" & $frame.payload.len
       peer.lastReceived = getMonoTime()
       
@@ -142,7 +142,7 @@ proc readerLoop(peer: AsyncPeer) {.async.} =
       break
 
 proc writerLoop(peer: AsyncPeer) {.async.} =
-  let keepalive = encodeFrame(iwKeepAlive, [])
+  let keepalive = encodeFrame(KeepAlive, [])
   
   while peer.running:
     let sleepFut = sleepAsync(chronos.milliseconds(KeepaliveIntervalMs))

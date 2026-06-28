@@ -1,27 +1,15 @@
-## Unprivileged SOCKS5 and HTTP CONNECT proxy mode boundary.
+## Unprivileged SOCKS5 and HTTP CONNECT proxy mode boundary using Chronos.
 ## Fully supports SOCKS5 and HTTP CONNECT proxy protocols, with dual-stack
 ## binding and username/password authentication.
 
-import std/[options, strutils, net, base64]
+import std/[options, strutils, base64, os]
+import chronos
+import chronos/transports/stream
 import ../core/types
 import ../util/hostsfile
-
-proc hexU16(g: int): string =
-  const Digits = "0123456789abcdef"
-  if g == 0: return "0"
-  var x = g
-  var tmp: array[4, char]
-  var pos = 4
-  while x != 0:
-    dec pos
-    tmp[pos] = Digits[x and 0x0f]
-    x = x shr 4
-  result = ""
-  for i in pos ..< 4: result.add tmp[i]
+import ../util/ipnet
 
 type
-  ProxyProtocol* = enum ppSocks5, ppHttpConnect
-
   ProxyConfig* = object
     enabled*: bool
     listen*: string
@@ -31,67 +19,10 @@ type
     password*: string
     hostsFile*: string
 
-  ListenerSpec* = object
-    host*: string
-    port*: Port
-
   ProxyServer* = ref object
     cfg*: ProxyConfig
+    servers*: seq[StreamServer]
     running*: bool
-    thread4: Thread[tuple[server: ProxyServer, spec: ListenerSpec]]
-    thread6: Thread[tuple[server: ProxyServer, spec: ListenerSpec]]
-    hasThread4: bool
-    hasThread6: bool
-
-proc defaultProxyConfig*(): ProxyConfig =
-  ProxyConfig(enabled: false, listen: "[::1]:1080", socks5: true, http: true, username: "", password: "", hostsFile: "hosts")
-
-proc parseListen*(listen: string): seq[ListenerSpec] =
-  let clean = listen.strip()
-  if clean.len == 0: raise newException(ValueError, "empty proxy listen address")
-  var host: string
-  var portStr: string
-  if clean.startsWith("["):
-    let close = clean.find(']')
-    if close < 0: raise newException(ValueError, "invalid bracketed IPv6 listen address")
-    host = clean[1 ..< close]
-    if close + 1 >= clean.len or clean[close + 1] != ':':
-      raise newException(ValueError, "missing proxy listen port")
-    portStr = clean[close + 2 .. ^1]
-  else:
-    let p = clean.rfind(':')
-    if p < 0: raise newException(ValueError, "missing proxy listen port")
-    host = clean[0 ..< p]
-    portStr = clean[p + 1 .. ^1]
-  let portInt = parseInt(portStr)
-  if portInt <= 0 or portInt > 65535: raise newException(ValueError, "proxy listen port out of range")
-  let port = Port(portInt)
-  if host.len == 0 or host == "*":
-    result.add ListenerSpec(host: "0.0.0.0", port: port)
-    result.add ListenerSpec(host: "::", port: port)
-  elif host.toLowerAscii() == "localhost" or host == "::1" or host == "127.0.0.1":
-    result.add ListenerSpec(host: "127.0.0.1", port: port)
-    result.add ListenerSpec(host: "::1", port: port)
-  else:
-    result.add ListenerSpec(host: host, port: port)
-
-proc recvExact(sock: Socket, n: int, timeout = 10000): string =
-  result = ""
-  while result.len < n:
-    let chunk = sock.recv(n - result.len, timeout)
-    if chunk.len == 0: raise newException(IOError, "socket closed")
-    result.add chunk
-
-proc byteAt(s: string, i: int): int = ord(s[i]) and 0xff
-
-proc sendSocksReply(client: Socket, status: byte) =
-  var reply = newString(10)
-  reply[0] = char(0x05)
-  reply[1] = char(status)
-  reply[2] = char(0x00)
-  reply[3] = char(0x01)
-  for i in 4 ..< 10: reply[i] = char(0)
-  client.send(reply)
 
 proc isIpLiteral(host: string): bool =
   if host.contains(":"): return true
@@ -106,8 +37,6 @@ proc isIpLiteral(host: string): bool =
   true
 
 proc resolveProxyHost(server: ProxyServer, host: string): string =
-  ## SOCKS5h/HTTP CONNECT domain names are resolved against the configured
-  ## Yggdrasil hosts file before falling back to the OS resolver.
   if host.isIpLiteral(): return host
   try:
     let hosts = loadHostsFile(server.cfg.hostsFile)
@@ -117,115 +46,133 @@ proc resolveProxyHost(server: ProxyServer, host: string): string =
     discard
   host
 
-proc connectDirect(server: ProxyServer, host: string, port: int): Socket =
-  let resolved = resolveProxyHost(server, host)
-  let domain = if resolved.contains(":"): AF_INET6 else: AF_INET
-  result = newSocket(domain = domain, buffered = false)
+proc relayTraffic(client, target: StreamTransport) {.async.} =
   try:
-    result.connect(resolved, Port(port), timeout = 10000)
+    proc pump(src, dst: StreamTransport, name: string) {.async.} =
+      var buf: array[32768, byte]
+      while not src.atEof():
+        let n = await src.readOnce(addr buf[0], buf.len)
+        if n <= 0:
+          break
+        let w = await dst.write(addr buf[0], n)
+        if w != n:
+          break
+        
+    let f1 = pump(client, target, "C->T")
+    let f2 = pump(target, client, "T->C")
+    let finished = await race(f1, f2)
+    # Cancel the other one
+    if not f1.finished: f1.cancelSoon()
+    if not f2.finished: f2.cancelSoon()
+    await allFutures(f1, f2)
   except CatchableError:
-    result.close()
-    raise
+    discard
+  finally:
+    await allFutures(client.closeWait(), target.closeWait())
 
-proc relayTraffic(client, target: Socket) =
-  ## Minimal bidirectional validation relay.
-  var request = ""
-  while request.len < 1024 * 1024:
-    let chunk = client.recv(1, 10000)
-    if chunk.len == 0: break
-    request.add chunk
-    if request.contains("\r\n\r\n"): break
-  if request.len > 0: target.send(request)
-
-  while true:
-    let chunk = target.recv(1, 5000)
-    if chunk.len == 0: break
-    client.send(chunk)
-
-proc handleSocks5(server: ProxyServer, client: Socket, hello: string) =
-  var target: Socket = nil
+proc handleSocks5(server: ProxyServer, client: StreamTransport) {.async.} =
   try:
-    let nmethods = byteAt(hello, 1)
-    let methods = client.recvExact(nmethods)
+    var nmethodsBuf: array[1, byte]
+    await client.readExactly(addr nmethodsBuf[0], 1)
+    let nmethods = int(nmethodsBuf[0])
+    var methods = newSeq[byte](nmethods)
+    await client.readExactly(addr methods[0], nmethods)
     
     let reqAuth = server.cfg.username.len > 0 or server.cfg.password.len > 0
     var chosenMethod: byte = 0xff
     
     if reqAuth:
-      for charM in methods:
-        if byteAt($charM, 0) == 0x02: chosenMethod = 0x02; break
+      for m in methods:
+        if m == 0x02: chosenMethod = 0x02; break
     else:
-      for charM in methods:
-        if byteAt($charM, 0) == 0x00: chosenMethod = 0x00; break
+      for m in methods:
+        if m == 0x00: chosenMethod = 0x00; break
         
     if chosenMethod == 0xff:
-      client.send("\x05\xff") # No acceptable auth methods
+      discard await client.write(@[0x05'u8, 0xff'u8])
+      await client.closeWait()
       return
       
-    client.send("\x05" & $char(chosenMethod))
+    discard await client.write(@[0x05'u8, chosenMethod])
     
     if chosenMethod == 0x02:
-      # RFC 1929 Username/Password auth
-      let authVer = byteAt(client.recvExact(1), 0)
-      if authVer != 0x01: return
-      let uLen = byteAt(client.recvExact(1), 0)
-      let uname = client.recvExact(uLen)
-      let pLen = byteAt(client.recvExact(1), 0)
-      let passwd = client.recvExact(pLen)
+      var verBuf: array[1, byte]
+      await client.readExactly(addr verBuf[0], 1)
+      if verBuf[0] != 0x01: return
+      var ulenBuf: array[1, byte]
+      await client.readExactly(addr ulenBuf[0], 1)
+      let ulen = int(ulenBuf[0])
+      var uname = newString(ulen)
+      await client.readExactly(addr uname[0], ulen)
+      var plenBuf: array[1, byte]
+      await client.readExactly(addr plenBuf[0], 1)
+      let plen = int(plenBuf[0])
+      var passwd = newString(plen)
+      await client.readExactly(addr passwd[0], plen)
       
       if uname == server.cfg.username and passwd == server.cfg.password:
-        client.send("\x01\x00") # Auth success
+        discard await client.write(@[0x01'u8, 0x00'u8])
       else:
-        client.send("\x01\x01") # Auth failure
+        discard await client.write(@[0x01'u8, 0x01'u8])
+        await client.closeWait()
         return
 
-    let hdr = client.recvExact(4)
-    if byteAt(hdr, 0) != 5 or byteAt(hdr, 1) != 1:
-      client.sendSocksReply(0x07'u8)
+    var hdr: array[4, byte]
+    await client.readExactly(addr hdr[0], 4)
+    if hdr[0] != 5 or hdr[1] != 1:
+      discard await client.write(@[0x05'u8, 0x07'u8, 0x00'u8, 0x01'u8, 0, 0, 0, 0, 0, 0])
+      await client.closeWait()
       return
-    let atyp = byteAt(hdr, 3)
+      
+    let atyp = hdr[3]
     var host = ""
     case atyp
     of 1:
-      let raw = client.recvExact(4)
-      host = $byteAt(raw, 0) & "." & $byteAt(raw, 1) & "." & $byteAt(raw, 2) & "." & $byteAt(raw, 3)
+      var raw: array[4, byte]
+      await client.readExactly(addr raw[0], 4)
+      host = $raw[0] & "." & $raw[1] & "." & $raw[2] & "." & $raw[3]
     of 3:
-      let ln = byteAt(client.recvExact(1), 0)
-      host = client.recvExact(ln)
+      var lnBuf: array[1, byte]
+      await client.readExactly(addr lnBuf[0], 1)
+      let ln = int(lnBuf[0])
+      host = newString(ln)
+      await client.readExactly(addr host[0], ln)
     of 4:
-      let raw = client.recvExact(16)
+      var raw: array[16, byte]
+      await client.readExactly(addr raw[0], 16)
       var groups: seq[string]
       for i in 0 ..< 8:
-        let g = (byteAt(raw, i * 2) shl 8) or byteAt(raw, i * 2 + 1)
-        groups.add hexU16(g)
+        groups.add strutils.toHex((uint16(raw[i*2]) shl 8) or uint16(raw[i*2+1]), 4)
       host = groups.join(":")
     else:
-      client.sendSocksReply(0x08'u8)
+      discard await client.write(@[0x05'u8, 0x08'u8, 0x00'u8, 0x01'u8, 0, 0, 0, 0, 0, 0])
+      await client.closeWait()
       return
-    let p = client.recvExact(2)
-    let port = (byteAt(p, 0) shl 8) or byteAt(p, 1)
+      
+    var pBuf: array[2, byte]
+    await client.readExactly(addr pBuf[0], 2)
+    let port = (int(pBuf[0]) shl 8) or int(pBuf[1])
 
+    let resolved = server.resolveProxyHost(host)
     try:
-      target = connectDirect(server, host, port)
+      let address = initTAddress(resolved, port)
+      let target = await connect(address)
+      discard await client.write(@[0x05'u8, 0x00'u8, 0x00'u8, 0x01'u8, 0, 0, 0, 0, 0, 0])
+      await relayTraffic(client, target)
     except CatchableError:
-      client.sendSocksReply(0x05'u8)
-      return
-    client.sendSocksReply(0x00'u8)
-    relayTraffic(client, target)
+      discard await client.write(@[0x05'u8, 0x05'u8, 0x00'u8, 0x01'u8, 0, 0, 0, 0, 0, 0])
+      await client.closeWait()
   except CatchableError:
-    discard
-  finally:
-    if target != nil: target.close()
-    client.close()
+    await client.closeWait()
 
-proc handleHttpConnect(server: ProxyServer, client: Socket, line: string) =
-  var target: Socket = nil
+proc handleHttpConnect(server: ProxyServer, client: StreamTransport, initial: string) {.async.} =
   try:
-    var request = line
+    var request = initial
     while not request.contains("\r\n\r\n"):
-      let chunk = client.recv(1, 10000)
-      if chunk.len == 0: return
-      request.add chunk
+      var buf: array[1024, char]
+      let n = await client.readOnce(addr buf[0], buf.len)
+      if n <= 0: return
+      for i in 0 ..< n: request.add buf[i]
       
     let reqAuth = server.cfg.username.len > 0 or server.cfg.password.len > 0
     if reqAuth:
@@ -236,10 +183,12 @@ proc handleHttpConnect(server: ProxyServer, client: Socket, line: string) =
           let authVal = rLine.split(':', 1)[1].strip()
           if authVal == expectedOpt: authOk = true; break
       if not authOk:
-        client.send("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"yggdrasil.nim\"\r\n\r\n")
+        discard await client.write("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"yggdrasil.nim\"\r\n\r\n")
+        await client.closeWait()
         return
 
-    let parts = line.splitWhitespace()
+    let parts = request.splitLines()[0].splitWhitespace()
+    if parts.len < 2: return
     let targetStr = parts[1]
     var host = ""
     var port = 443
@@ -257,65 +206,71 @@ proc handleHttpConnect(server: ProxyServer, client: Socket, line: string) =
       else:
         host = targetStr
 
+    let resolved = server.resolveProxyHost(host)
     try:
-      target = connectDirect(server, host, port)
+      let address = initTAddress(resolved, port)
+      let target = await connect(address)
+      discard await client.write("HTTP/1.1 200 Connection Established\r\n\r\n")
+      await relayTraffic(client, target)
     except CatchableError:
-      client.send("HTTP/1.1 502 Bad Gateway\r\n\r\n")
-      return
-      
-    client.send("HTTP/1.1 200 Connection Established\r\n\r\n")
-    relayTraffic(client, target)
+      discard await client.write("HTTP/1.1 502 Bad Gateway\r\n\r\n")
+      await client.closeWait()
   except CatchableError:
-    discard
-  finally:
-    if target != nil: target.close()
-    client.close()
+    await client.closeWait()
 
-proc handleClient(server: ProxyServer, client: Socket) =
+proc handleClient(server: ProxyServer, client: StreamTransport) {.async.} =
   try:
-    let first = client.recvExact(1)
-    if byteAt(first, 0) == 0x05:
-      let second = client.recvExact(1)
-      if server.cfg.socks5: handleSocks5(server, client, first & second)
-      else: client.close()
-    elif first == "C" or first == "c":
-      let rest = client.recvExact(7)
-      if server.cfg.http and (first & rest).toUpperAscii() == "CONNECT ":
-        handleHttpConnect(server, client, first & rest)
-      else: client.close()
+    var first: array[1, byte]
+    await client.readExactly(addr first[0], 1)
+    if first[0] == 0x05:
+      if server.cfg.socks5: await handleSocks5(server, client)
+      else: await client.closeWait()
+    elif first[0] == byte('C') or first[0] == byte('c'):
+      var rest = newString(7)
+      await client.readExactly(addr rest[0], 7)
+      if server.cfg.http and (char(first[0]) & rest).toUpperAscii() == "CONNECT ":
+        await handleHttpConnect(server, client, char(first[0]) & rest)
+      else: await client.closeWait()
     else:
-      client.close()
+      await client.closeWait()
   except CatchableError:
-    client.close()
-
-proc listenerThread(arg: tuple[server: ProxyServer, spec: ListenerSpec]) {.thread.} =
-  let domain = if arg.spec.host.contains(":"): AF_INET6 else: AF_INET
-  var sock = newSocket(domain = domain, buffered = false)
-  try:
-    sock.setSockOpt(OptReuseAddr, true)
-    sock.bindAddr(arg.spec.port, arg.spec.host)
-    sock.listen()
-    while arg.server.running:
-      var client: Socket
-      sock.accept(client)
-      handleClient(arg.server, client)
-  except CatchableError:
-    discard
-  finally:
-    sock.close()
+    await client.closeWait()
 
 proc newProxyServer*(cfg: ProxyConfig): ProxyServer = ProxyServer(cfg: cfg, running: false)
 
 proc start*(s: ProxyServer) =
   if not s.cfg.enabled: return
-  let specs = parseListen(s.cfg.listen)
-  if specs.len == 0: return
+  
+  let p = s.cfg.listen.rfind(':')
+  if p < 0: return
+  let host = s.cfg.listen[0 ..< p]
+  let port = Port(parseInt(s.cfg.listen[p + 1 .. ^1]))
+  
+  let hosts = if host == "" or host == "*" or host == "0.0.0.0" or host == "::":
+                @[initTAddress("0.0.0.0", port), initTAddress("::", port)]
+              elif host == "localhost" or host == "127.0.0.1" or host == "::1":
+                @[initTAddress("127.0.0.1", port), initTAddress("::1", port)]
+              else:
+                @[initTAddress(host, port)]
+
+  for addr in hosts:
+    try:
+      let server = createStreamServer(addr, proc(server: StreamServer, transp: StreamTransport) {.async: (raises: []).} =
+        try:
+          await handleClient(s, transp)
+        except CatchableError:
+          discard
+      )
+      server.start()
+      s.servers.add(server)
+      stderr.writeLine "[proxy] Listening on ", $addr
+    except CatchableError as e:
+      stderr.writeLine "[proxy] Failed to listen on ", $addr, ": ", e.msg
   s.running = true
-  createThread(s.thread4, listenerThread, (s, specs[0]))
-  s.hasThread4 = true
-  if specs.len > 1:
-    createThread(s.thread6, listenerThread, (s, specs[1]))
-    s.hasThread6 = true
 
 proc stop*(s: ProxyServer) =
   s.running = false
+  for server in s.servers:
+    server.stop()
+    server.close()
+  s.servers.setLen(0)

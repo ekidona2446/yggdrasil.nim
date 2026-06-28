@@ -172,7 +172,7 @@ proc runTcpIronwoodLink*(cfg: LinkRunConfig): seq[LinkLog] =
   var lastMaintenance = epochTime()
   while epochTime() < until:
     if epochTime() - lastKeepalive > 10:
-      sock.send(rawBytes(encodeFrame(iwKeepAlive, [])))
+      sock.send(rawBytes(encodeFrame(KeepAlive, [])))
       lastKeepalive = epochTime()
     if epochTime() - lastMaintenance > 5:
       let mt = state.maintenance()

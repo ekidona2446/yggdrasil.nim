@@ -639,6 +639,7 @@ proc start*(manager: LinkManager) {.async.} =
       echo "failed to listen on ", addrStr, ": ", e.msg
 
   for uri in manager.config.peerUris:
+    if uri.len == 0: continue
     try:
       let parsed = parsePeerUri(uri)
       case parsed.kind

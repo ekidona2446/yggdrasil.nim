@@ -395,6 +395,7 @@ proc main() =
     echo "generated ", generateConfigPath, " with ", n, " reachable public peers; tun=", tunEnable, " proxy=", proxyEnable, " proxy listen=", listen
     return
 
+  echo "loading config from: ", configPath
   # Load config
   var cfg = loadConfig(configPath)
   if keyOverride.len > 0: cfg.node.keyfile = keyOverride
@@ -454,12 +455,15 @@ proc main() =
   # Run async daemon
   let proxyListen = if socks5Addr.len > 0: socks5Addr else: cfg.proxy.listen
   let platformTun = defaultTunConfig()
-  let tunName = if tunNameOverride.len > 0: tunNameOverride else: platformTun.name
+  var tunName = if tunNameOverride.len > 0: tunNameOverride else: cfg.tun.name
+  if tunName.len == 0: tunName = platformTun.name
+  let tunMtu = if cfg.tun.mtu > 0: cfg.tun.mtu else: platformTun.mtu
+
   waitFor runDaemon(
     listenAddrs, peerUris, cfg.node.keyfile,
     cfg.tun.enable, cfg.proxy.enable, cfg.dns.enable,
     proxyListen, cfg.dns.listen, cfg.dns.hostsFile, cfg.dns.upstream,
-    tunName, cfg.tun.mtu,
+    tunName, tunMtu,
   )
 
 when isMainModule:

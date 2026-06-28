@@ -14,16 +14,16 @@ const
 
 type
   PacketType* = enum
-    iwDummy = 0'u8,
-    iwKeepAlive = 1'u8,
-    iwProtoSigReq = 2'u8,
-    iwProtoSigRes = 3'u8,
-    iwProtoAnnounce = 4'u8,
-    iwProtoBloomFilter = 5'u8,
-    iwProtoPathLookup = 6'u8,
-    iwProtoPathNotify = 7'u8,
-    iwProtoPathBroken = 8'u8,
-    iwTraffic = 9'u8
+    Dummy = 0,
+    KeepAlive = 1,
+    ProtoSigReq = 2,
+    ProtoSigRes = 3,
+    ProtoAnnounce = 4,
+    ProtoBloomFilter = 5,
+    ProtoPathLookup = 6,
+    ProtoPathNotify = 7,
+    ProtoPathBroken = 8,
+    Traffic = 9
 
   PeerPort* = uint64
   Path* = seq[PeerPort]
@@ -42,7 +42,7 @@ type
     nonce*: uint64
     signature*: array[64, byte]
 
-  Traffic* = object
+  TrafficPacket* = object
     path*: Path
     fromPath*: Path
     source*: NodeId
@@ -52,16 +52,16 @@ type
 
 proc toPacketType*(b: byte): Option[PacketType] =
   case b
-  of 0: some(iwDummy)
-  of 1: some(iwKeepAlive)
-  of 2: some(iwProtoSigReq)
-  of 3: some(iwProtoSigRes)
-  of 4: some(iwProtoAnnounce)
-  of 5: some(iwProtoBloomFilter)
-  of 6: some(iwProtoPathLookup)
-  of 7: some(iwProtoPathNotify)
-  of 8: some(iwProtoPathBroken)
-  of 9: some(iwTraffic)
+  of 0: some(Dummy)
+  of 1: some(KeepAlive)
+  of 2: some(ProtoSigReq)
+  of 3: some(ProtoSigRes)
+  of 4: some(ProtoAnnounce)
+  of 5: some(ProtoBloomFilter)
+  of 6: some(ProtoPathLookup)
+  of 7: some(ProtoPathNotify)
+  of 8: some(ProtoPathBroken)
+  of 9: some(Traffic)
   else: none(PacketType)
 
 proc encodeUvarint*(value: uint64, outBuf: var seq[byte]) =
@@ -161,7 +161,7 @@ proc decodeSigReq*(payload: openArray[byte]): Option[SigReq] =
   if b.isNone: return none(SigReq)
   some(SigReq(seq: a.get().value, nonce: b.get().value))
 
-proc encodeTrafficPayload*(t: Traffic): seq[byte] =
+proc encodeTrafficPayload*(t: TrafficPacket): seq[byte] =
   encodePath(t.path, result)
   encodePath(t.fromPath, result)
   for b in t.source.bytes: result.add b
@@ -169,26 +169,26 @@ proc encodeTrafficPayload*(t: Traffic): seq[byte] =
   encodeUvarint(t.watermark, result)
   for b in t.payload: result.add b
 
-proc encodeTrafficFrame*(t: Traffic): seq[byte] = encodeFrame(iwTraffic, encodeTrafficPayload(t))
+proc encodeTrafficFrame*(t: TrafficPacket): seq[byte] = encodeFrame(Traffic, encodeTrafficPayload(t))
 
-proc decodeTraffic*(payload: openArray[byte]): Option[Traffic] =
+proc decodeTraffic*(payload: openArray[byte]): Option[TrafficPacket] =
   var off = 0
   let p = decodePath(payload, off)
-  if p.isNone: return none(Traffic)
+  if p.isNone: return none(TrafficPacket)
   off += p.get().consumed
   let f = decodePath(payload, off)
-  if f.isNone: return none(Traffic)
+  if f.isNone: return none(TrafficPacket)
   off += f.get().consumed
   let src = readNodeId(payload, off)
-  if src.isNone: return none(Traffic)
+  if src.isNone: return none(TrafficPacket)
   let dst = readNodeId(payload, off)
-  if dst.isNone: return none(Traffic)
+  if dst.isNone: return none(TrafficPacket)
   let wm = decodeUvarint(payload, off)
-  if wm.isNone: return none(Traffic)
+  if wm.isNone: return none(TrafficPacket)
   off += wm.get().consumed
   var rest: seq[byte]
   for i in off ..< payload.len: rest.add payload[i]
-  some(Traffic(path: p.get().path, fromPath: f.get().path, source: src.get(),
+  some(TrafficPacket(path: p.get().path, fromPath: f.get().path, source: src.get(),
                dest: dst.get(), watermark: wm.get().value, payload: rest))
 
 proc encodeBloom*(data: array[BloomFilterU64s, uint64]): seq[byte] =

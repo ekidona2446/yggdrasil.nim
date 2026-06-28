@@ -18,5 +18,5 @@ type
     peerId*: PeerId
     peerKey*: NodeId
     frame*: Frame
-    traffic*: Traffic
+    traffic*: TrafficPacket
     priority*: uint8     ## Peer priority for addPeer
