@@ -106,7 +106,13 @@ proc tryWriteNonblocking(fd: cint, data: pointer, n: int): bool =
   true
 
 proc readAll(fd: cint, data: pointer, n: int): bool =
-  ## Blocking read of exactly n bytes. Returns false on EOF/fatal error.
+  ## Read exactly n bytes. Returns false on EOF/fatal error.
+  ## NOTE: the bridge fd is opened in non-blocking mode (so the read thread's
+  ## writes never block), which means read() here can legitimately return
+  ## EAGAIN/EWOULDBLOCK when no data is available yet. Treat that as "wait and
+  ## retry" rather than a fatal error — otherwise the TUN write thread would
+  ## die on the first idle read and inbound packets would silently stop being
+  ## delivered to the kernel.
   var off = 0
   while off < n:
     let r = posix.read(fd, cast[pointer](cast[uint](data) + uint(off)),
@@ -115,6 +121,11 @@ proc readAll(fd: cint, data: pointer, n: int): bool =
     elif r == 0: return false
     else:
       if errno == EINTR: continue
+      if errno == EAGAIN or errno == EWOULDBLOCK:
+        # No data ready; block briefly on the fd then retry.
+        var pfd = TPollfd(fd: fd, events: POLLIN, revents: 0)
+        discard posix.poll(addr pfd, 1, 1000)
+        continue
       return false
   true
 

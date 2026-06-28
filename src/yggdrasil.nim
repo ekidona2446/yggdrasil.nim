@@ -28,6 +28,14 @@ import ./tun/tunadapter
 
 const Version* = "0.0.1"
 
+# Session payload type bytes, matching yggdrasil-go's core/types.go.
+# Core.WriteTo prepends one of these to every ironwood session payload and
+# Core.ReadFrom switches on it.
+const
+  typeSessionDummy*   = 0'u8
+  typeSessionTraffic* = 1'u8   # IPv6 data packets
+  typeSessionProto*   = 2'u8   # nodeinfo / debug protocol
+
 # ── Data plane: TUN <-> PacketConn ───────────────────────────────────────
 
 proc tunToOverlay(tun: TunAdapter, pc: PacketConn) {.async.} =
@@ -55,12 +63,16 @@ proc tunToOverlay(tun: TunAdapter, pc: PacketConn) {.async.} =
       else:
         continue
 
-      # Prepend typeSessionTraffic byte (0x00) matching Go's Core.WriteTo.
-      # Go's Core.ReadFrom inspects the first byte to distinguish traffic
-      # (0x00) from protocol messages (0x01); IPv6 packets start with 0x60
-      # and would be silently dropped without the type prefix.
-      var typed: seq[byte]
-      typed.add 0x00'u8
+      # yggdrasil-go's Core.WriteTo wraps every ironwood session payload with a
+      # single type byte before encryption:
+      #   typeSessionDummy   = 0
+      #   typeSessionTraffic = 1   <-- IPv6 data packets
+      #   typeSessionProto   = 2   <-- nodeinfo/debug protocol
+      # Core.ReadFrom switches on that byte and strips it. The previous Nim
+      # code used 0x00 (typeSessionDummy), which Go's ReadFrom dropped via the
+      # `default: continue` branch. The correct prefix for IPv6 traffic is 0x01.
+      var typed = newSeqOfCap[byte](packet.len + 1)
+      typed.add typeSessionTraffic
       for b in packet: typed.add b
       try:
         await pc.writeTo(destKey, typed)
@@ -74,18 +86,23 @@ proc tunToOverlay(tun: TunAdapter, pc: PacketConn) {.async.} =
 
 proc overlayToTun(pc: PacketConn, tun: TunAdapter) {.async.} =
   ## Read deliveries from PacketConn, write to TUN.
-  ## Strips the typeSessionTraffic/typeSessionProto prefix byte that Go's
-  ## Core.ReadFrom adds; only typeSessionTraffic (0x00) data is forwarded
-  ## to the TUN as an IPv6 packet.
+  ## Mirror yggdrasil-go's Core.ReadFrom: the decrypted session payload begins
+  ## with a type byte (typeSessionTraffic = 0x01 for IPv6 data, typeSessionProto
+  ## = 0x02 for nodeinfo/debug). Strip the leading byte and, for traffic, write
+  ## the remaining IPv6 packet to the TUN. Non-traffic payloads are ignored here.
   var buf = newSeq[byte](65536)
   while tun.running:
     try:
       let (n, source) = await pc.readFrom(addr buf[0], buf.len)
-      if n == 0: continue
-      if buf[0] != 0x00: continue  # skip non-traffic (typeSessionProto etc.)
+      if n < 1: continue
+      let payloadType = buf[0]
+      if payloadType != typeSessionTraffic:
+        # typeSessionProto (nodeinfo/debug) or dummy — not IPv6 data.
+        continue
       let pktLen = n - 1
-      if pktLen == 0: continue
-      stderr.writeLine "[dataplane] overlay -> TUN src=" & short(source) & " n=" & $pktLen
+      if pktLen < 40: continue            # too short to be an IPv6 packet
+      if (buf[1] and 0xf0'u8) != 0x60'u8: # sanity: must be an IPv6 packet
+        continue
       await tun.writePacket(buf[1 ..< n])
     except CancelledError:
       break
