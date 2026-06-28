@@ -152,6 +152,12 @@ proc writerLoop(peer: AsyncPeer) {.async.} =
     if completed == recvFut:
       let frameData = recvFut.read()
       try:
+        var ptOff = 0
+        while ptOff < frameData.len and (frameData[ptOff] and 0x80) != 0: ptOff.inc
+        ptOff.inc
+        let pType = if ptOff < frameData.len: frameData[ptOff] else: 0'u8
+        if pType in {5'u8, 6'u8, 7'u8, 9'u8}:
+          stderr.writeLine "[asyncpeer] WRITE type=" & $pType & " len=" & $frameData.len & " peer=" & short(peer.remoteKey)
         await peer.writer.write(frameData)
       except CatchableError as e:
         stderr.writeLine "[asyncpeer] writer error peer=" & short(peer.remoteKey) & ": " & e.msg
