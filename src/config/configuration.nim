@@ -6,7 +6,7 @@
 ## NOTE: TCP-AO was removed (not needed for Yggdrasil).
 ## TLS now planned to use WolfSSL instead of OpenSSL.
 
-import std/[os, strutils, tables, options, httpclient, net]
+import std/[os, strutils, tables, options, net]
 import toml_serialization/lexer
 import toml_serialization/types
 import toml_serialization
@@ -26,12 +26,22 @@ type
     nodeInfo*: Table[string, string]
 
   PeersConfig* = object
-    staticPeers*: seq[string]
-    multicast*: bool
-    multicastAddress*: string
-    multicastPort*: int
-    publicPeerLists*: seq[string]
-    peerExchange*: bool
+    staticPeers*:       seq[string]
+    multicast*:         bool
+    multicastAddress*:  string
+    multicastPort*:     int
+    multicastInterface*: string
+    ## URLs returning publicnodes.json-format data (empty → no JSON fetch).
+    publicPeerLists*:   seq[string]
+    ## GitHub repo slugs ("owner/repo") parsed via Trees API + raw Markdown.
+    githubPeerRepos*:   seq[string]
+    ## Human-readable refresh interval: "12h" | "1d" | "1w".
+    peerCheckInterval*: string
+    ## Drop peers whose Ironwood RTT exceeds this (0 = no limit).
+    maxPingMs*:         int
+    ## Path to persist the last known-good peer set.
+    peerCacheFile*:     string
+    peerExchange*:      bool
 
   TUNConfig* = object
     enable*: bool
@@ -175,12 +185,17 @@ proc defaultConfig*(): AppConfig =
   )
 
   result.peers = PeersConfig(
-    staticPeers: @[],
-    multicast: true,
-    multicastAddress: "ff02::114",
-    multicastPort: 12345,
-    publicPeerLists: @[],
-    peerExchange: true
+    staticPeers:        @[],
+    multicast:          true,
+    multicastAddress:   "ff02::114",
+    multicastPort:      12345,
+    multicastInterface: ".*",
+    publicPeerLists:    @[],
+    githubPeerRepos:    @[],
+    peerCheckInterval:  "1d",
+    maxPingMs:          0,
+    peerCacheFile:      "peers_cache.json",
+    peerExchange:       true
   )
 
   result.tun = TUNConfig(
@@ -255,12 +270,21 @@ proc loadConfig*(path: string): AppConfig =
       result.node.nodeInfo = getTableStr(nodeInfoSub)
 
   # Peers
-  result.peers.staticPeers = getSeqStr(getToml(root, "Peers", "static"))
-  result.peers.multicast = getBool(getToml(root, "Peers", "multicast"), result.peers.multicast)
-  result.peers.multicastAddress = getStr(getToml(root, "Peers", "multicastAddress"), result.peers.multicastAddress)
-  result.peers.multicastPort = getInt(getToml(root, "Peers", "multicastPort"), result.peers.multicastPort)
-  result.peers.publicPeerLists = getSeqStr(getToml(root, "Peers", "publicPeerLists"))
-  result.peers.peerExchange = getBool(getToml(root, "Peers", "peerExchange"), result.peers.peerExchange)
+  result.peers.staticPeers       = getSeqStr(getToml(root, "Peers", "static"))
+  result.peers.multicast         = getBool(getToml(root, "Peers", "multicast"),          result.peers.multicast)
+  result.peers.multicastAddress   = getStr(getToml(root, "Peers", "multicastAddress"),   result.peers.multicastAddress)
+  result.peers.multicastPort      = getInt(getToml(root, "Peers", "multicastPort"),      result.peers.multicastPort)
+  result.peers.multicastInterface = getStr(getToml(root, "Peers", "multicastInterface"), result.peers.multicastInterface)
+  let jsonLists = getSeqStr(getToml(root, "Peers", "publicPeerLists"))
+  if jsonLists.len > 0: result.peers.publicPeerLists = jsonLists
+  let ghRepos = getSeqStr(getToml(root, "Peers", "githubPeerRepos"))
+  if ghRepos.len > 0: result.peers.githubPeerRepos = ghRepos
+  let checkIv = getStr(getToml(root, "Peers", "peerCheckInterval"), "")
+  if checkIv.len > 0: result.peers.peerCheckInterval = checkIv
+  result.peers.maxPingMs          = getInt(getToml(root, "Peers", "maxPingMs"),          result.peers.maxPingMs)
+  let cacheFile = getStr(getToml(root, "Peers", "peerCacheFile"), "")
+  if cacheFile.len > 0: result.peers.peerCacheFile = cacheFile
+  result.peers.peerExchange      = getBool(getToml(root, "Peers", "peerExchange"),       result.peers.peerExchange)
 
   # TUN
   result.tun.enable = getBool(getToml(root, "TUN", "enable"), result.tun.enable)
@@ -337,15 +361,29 @@ proc generateConfigToml*(cfg: AppConfig, includeSecrets = false): string =
     result.add genQuoted(p)
   result.add "]\n"
   result.add "multicast = " & (if cfg.peers.multicast: "true" else: "false") & "\n"
-  if cfg.peers.multicastAddress != "ff02::114":
+  if cfg.peers.multicastAddress.len > 0 and cfg.peers.multicastAddress != "ff02::114":
     result.add "multicastAddress = " & genQuoted(cfg.peers.multicastAddress) & "\n"
   result.add "multicastPort = " & $cfg.peers.multicastPort & "\n"
+  if cfg.peers.multicastInterface.len > 0:
+    result.add "multicastInterface = " & genQuoted(cfg.peers.multicastInterface) & "\n"
   if cfg.peers.publicPeerLists.len > 0:
     result.add "publicPeerLists = ["
     for i, p in cfg.peers.publicPeerLists:
       if i > 0: result.add ", "
       result.add genQuoted(p)
     result.add "]\n"
+  if cfg.peers.githubPeerRepos.len > 0:
+    result.add "githubPeerRepos = ["
+    for i, r in cfg.peers.githubPeerRepos:
+      if i > 0: result.add ", "
+      result.add genQuoted(r)
+    result.add "]\n"
+  if cfg.peers.peerCheckInterval.len > 0:
+    result.add "peerCheckInterval = " & genQuoted(cfg.peers.peerCheckInterval) & "\n"
+  if cfg.peers.maxPingMs > 0:
+    result.add "maxPingMs = " & $cfg.peers.maxPingMs & "\n"
+  if cfg.peers.peerCacheFile.len > 0:
+    result.add "peerCacheFile = " & genQuoted(cfg.peers.peerCacheFile) & "\n"
   result.add "peerExchange = " & (if cfg.peers.peerExchange: "true" else: "false") & "\n"
   result.add "\n"
 
@@ -452,14 +490,14 @@ proc generateConfigToml*(cfg: AppConfig, includeSecrets = false): string =
 # Public peer helpers and generated config (moved from yggdrasil.nim)
 # =============================================================================
 
-const DefaultPublicPeersUrl* = "https://publicpeers.neilalexander.dev/publicnodes.json"
-
-proc fetchText*(source: string): string =
-  if source.startsWith("http://") or source.startsWith("https://"):
-    var client = newHttpClient(headers = newHttpHeaders({"User-Agent": "yggdrasil.nim/0.0.1"}))
-    result = client.getContent(source)
-  else:
-    result = readFile(source)
+## fetchText, fetchAllPeers, fetchGithubMarkdownPeers etc. are defined in
+## publicpeers.nim (already imported above).  Re-export for callers that only
+## import configuration.
+export publicpeers.fetchText, publicpeers.fetchAllPeers,
+       publicpeers.fetchGithubMarkdownPeers,
+       publicpeers.parsePeerCheckInterval, publicpeers.shouldRefreshCache,
+       publicpeers.savePeerCache, publicpeers.loadPeerCache,
+       publicpeers.filterByPing, publicpeers.peerCacheAge
 
 proc tomlQuote(s: string): string =
   result = "\"" & s.replace("\\", "\\\\").replace("\"", "\\\"") & "\""
@@ -518,40 +556,62 @@ proc addDnsUpstreamsToConfig*(path: string; servers: seq[string]) =
     writeFile(path, lines.join("\n") & "\n")
 
 proc writeGeneratedConfig*(path: string; peers: seq[PublicPeer]; listen: string; keyfile: string;
-                           tunEnable, proxyEnable: bool) =
+                           tunEnable, proxyEnable: bool;
+                           jsonUrls: seq[string] = @[];
+                           githubRepos: seq[string] = @[];
+                           checkInterval = "1d"; maxPingMs = 0;
+                           cacheFile = "peers_cache.json") =
   ## Write a complete, portable TOML config.  Do not hard-code Linux-only TUN
   ## names/admin sockets here: defaultConfig() already selects platform defaults
   ## for Linux, macOS, Windows and other targets at compile time.
+  ##
+  ## jsonUrls / githubRepos are written as-is from the caller — no URL is ever
+  ## hard-coded in this function.
   var cfg = defaultConfig()
   cfg.node.keyfile = keyfile
   cfg.node.name = "generated-node"
   cfg.node.nodeInfo["implementation"] = "yggdrasil.nim"
-  cfg.peers.staticPeers = @[]
+  cfg.peers.staticPeers       = @[]
   for p in peers: cfg.peers.staticPeers.add(p.uri)
-  cfg.peers.multicast = false
-  cfg.peers.peerExchange = true
-  cfg.peers.publicPeerLists = @[DefaultPublicPeersUrl]
+  cfg.peers.multicast         = false
+  cfg.peers.peerExchange      = true
+  cfg.peers.publicPeerLists   = jsonUrls
+  cfg.peers.githubPeerRepos   = githubRepos
+  cfg.peers.peerCheckInterval = checkInterval
+  cfg.peers.maxPingMs         = maxPingMs
+  cfg.peers.peerCacheFile     = cacheFile
   cfg.tun.enable = tunEnable
   # Keep cfg.tun.name/cfg.tun.mtu from platformDefaults().
   cfg.proxy.enable = proxyEnable
   cfg.proxy.listen = listen
   cfg.proxy.socks5 = true
-  cfg.proxy.http = true
-  cfg.dns.enable = true
+  cfg.proxy.http   = true
+  cfg.dns.enable   = true
   cfg.dns.hostsFile = "hosts"
   if cfg.dns.upstream.len == 0:
     cfg.dns.upstream = @["1.1.1.1:53", "8.8.8.8:53"]
-  cfg.admin.keepalive = true
-  cfg.crypto.postQuantum = false
+  cfg.admin.keepalive       = true
+  cfg.crypto.postQuantum    = false
   cfg.crypto.perHopProtection = false
   writeFile(path, generateConfigToml(cfg))
 
-proc generateReachableConfig*(path: string; peerSource: string; peerCount: int; listen: string;
-                            keyfile: string; tunEnable, proxyEnable: bool): int =
-  ## Fetch public peers, pick reachable ones, and write a TOML config file.
-  ## Returns the number of peers selected.
-  let content = fetchText(peerSource)
-  let allPeers = parsePublicPeersJson(content, onlyUp = true)
+proc generateReachableConfig*(path: string;
+                               jsonUrls: seq[string];
+                               githubRepos: seq[string];
+                               peerCount: int; listen: string;
+                               keyfile: string; tunEnable, proxyEnable: bool;
+                               checkInterval = "1d"; maxPingMs = 0;
+                               cacheFile = "peers_cache.json";
+                               token = ""): int =
+  ## Fetch public peers from all configured sources, pick reachable ones via
+  ## TCP probe, and write a TOML config file.  Returns the number of peers
+  ## selected.  No source URL is hard-coded — if both jsonUrls and githubRepos
+  ## are empty the function raises IOError.
+  if jsonUrls.len == 0 and githubRepos.len == 0:
+    raise newException(IOError,
+      "no peer source configured (set publicPeerLists or githubPeerRepos)")
+
+  let allPeers = fetchAllPeers(jsonUrls, githubRepos, onlyUp = true, token = token)
   var selected: seq[PublicPeer]
   for p in allPeers:
     if p.parsed.kind notin {tkTcp, tkTls, tkQuic, tkWebSocket}: continue
@@ -560,5 +620,6 @@ proc generateReachableConfig*(path: string; peerSource: string; peerCount: int; 
     if selected.len >= peerCount: break
   if selected.len == 0:
     raise newException(IOError, "no reachable TCP/TLS/QUIC/WebSocket public peers found")
-  writeGeneratedConfig(path, selected, listen, keyfile, tunEnable, proxyEnable)
+  writeGeneratedConfig(path, selected, listen, keyfile, tunEnable, proxyEnable,
+                       jsonUrls, githubRepos, checkInterval, maxPingMs, cacheFile)
   result = selected.len

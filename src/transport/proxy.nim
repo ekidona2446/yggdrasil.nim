@@ -238,13 +238,32 @@ proc handleClient(server: ProxyServer, client: StreamTransport) {.async.} =
 
 proc newProxyServer*(cfg: ProxyConfig): ProxyServer = ProxyServer(cfg: cfg, running: false)
 
+proc parseListenHostPort*(listen: string): tuple[host: string, port: Port] =
+  ## Parse "[::1]:1080" or "127.0.0.1:1080" or ":1080" style listen strings.
+  let clean = listen.strip()
+  if clean.startsWith("["):
+    let closeBracket = clean.find(']')
+    if closeBracket < 0: raise newException(ValueError, "invalid bracketed IPv6 listen addr: " & clean)
+    let h = clean[1 ..< closeBracket]
+    if closeBracket + 1 >= clean.len or clean[closeBracket + 1] != ':':
+      raise newException(ValueError, "missing port in listen addr: " & clean)
+    let portStr = clean[closeBracket + 2 .. ^1]
+    result = (h, Port(parseInt(portStr)))
+  else:
+    let p = clean.rfind(':')
+    if p < 0: raise newException(ValueError, "missing port in listen addr: " & clean)
+    result = (clean[0 ..< p], Port(parseInt(clean[p + 1 .. ^1])))
+
 proc start*(s: ProxyServer) =
   if not s.cfg.enabled: return
   
-  let p = s.cfg.listen.rfind(':')
-  if p < 0: return
-  let host = s.cfg.listen[0 ..< p]
-  let port = Port(parseInt(s.cfg.listen[p + 1 .. ^1]))
+  var host: string
+  var port: Port
+  try:
+    (host, port) = parseListenHostPort(s.cfg.listen)
+  except CatchableError as e:
+    stderr.writeLine "[proxy] bad listen address: ", e.msg
+    return
   
   let hosts = if host == "" or host == "*" or host == "0.0.0.0" or host == "::":
                 @[initTAddress("0.0.0.0", port), initTAddress("::", port)]

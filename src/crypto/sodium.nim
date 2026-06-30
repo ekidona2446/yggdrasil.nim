@@ -6,6 +6,14 @@
 ## XSalsa20-Poly1305 `crypto_box`.
 
 import std/[dynlib]
+import std/os
+
+when defined(windows):
+  const SodiumLib* = "libsodium.dll"
+elif defined(macosx):
+  const SodiumLib* = "libsodium.dylib"
+else:
+  const SodiumLib* = "libsodium.so"
 
 type
   SodiumError* = object of CatchableError
@@ -45,11 +53,21 @@ proc loadSym[T](lib: LibHandle, name: string): T =
 proc loadSodium*(): SodiumApi =
   if cached != nil: return cached
   var lib: LibHandle
-  for name in ["libsodium.so", "libsodium.so.23", "libsodium.dylib", "libsodium.dll"]:
+
+  let appDir = getAppDir()
+  let besideBinary = appDir / SodiumLib
+  if fileExists(besideBinary):
+    return besideBinary
+
+  let bundledLibDir = appDir / "lib" / SodiumLib
+  if fileExists(bundledLibDir):
+    return bundledLibDir
+
+  for name in [SodiumLib, "libsodium.so.23"]:
     lib = loadLib(name)
     if lib != nil: break
-  if lib == nil:
-    raise newException(SodiumError, "libsodium not found (install libsodium23/libsodium-dev)")
+  if lib == nil: raise newException(SodiumError, "libsodium not found (install libsodium23/libsodium-dev)")
+
   result = SodiumApi(lib: lib)
   result.sodium_init = loadSym[typeof(result.sodium_init)](lib, "sodium_init")
   result.randombytes_buf = loadSym[typeof(result.randombytes_buf)](lib, "randombytes_buf")

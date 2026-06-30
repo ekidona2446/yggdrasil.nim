@@ -360,10 +360,19 @@ proc main() =
     return
 
   if publicPeersSource.len > 0:
-    let content = configuration.fetchText(publicPeersSource)
-    let summary = summarizePublicPeersJson(content)
-    let peers = parsePublicPeersJson(content, onlyUp = true)
-    echo "publicPeers ", summary
+    # --check-public-peers accepts either a JSON URL/file or a GitHub "owner/repo" slug
+    var peers: seq[PublicPeer]
+    var summary: PublicPeerSummary
+    if publicPeersSource.contains('/') and not publicPeersSource.startsWith("http") and
+       not publicPeersSource.startsWith("/") and not fileExists(publicPeersSource):
+      # Looks like a GitHub slug
+      peers = fetchGithubMarkdownPeers(publicPeersSource)
+      echo "githubRepo=", publicPeersSource, " peers=", peers.len
+    else:
+      let content = fetchText(publicPeersSource)
+      summary = summarizePublicPeersJson(content)
+      peers = parsePublicPeersJson(content, onlyUp = true)
+      echo "publicPeers ", summary
     for i in 0 ..< min(10, peers.len):
       let p = peers[i]
       echo p.uri, " region=", p.region, " up=", p.up, " responseMs=", p.responseMs
@@ -371,8 +380,7 @@ proc main() =
 
   if generateConfigPath.len > 0:
     if peerCount <= 0: quit "--peer-count must be positive", 2
-    let source = if publicPeersSource.len > 0: publicPeersSource else: configuration.DefaultPublicPeersUrl
-    let listen = if socks5Addr.len > 0: socks5Addr else: "[::1]:1080"
+    let listen  = if socks5Addr.len > 0: socks5Addr else: "[::1]:1080"
     let keyfile = if keyOverride.len > 0: keyOverride else: "yggdrasil.key"
     try:
       discard loadOrCreateRouterCrypto(keyfile)
@@ -380,19 +388,29 @@ proc main() =
       quit "could not create keyfile " & keyfile & ": " & e.msg, 1
     # Default generated config is TUN-first.  Use --generate-proxy-config or
     # --proxy-mode for the old proxy-only behaviour, and --tun-proxy-mode for both.
-    var tunEnable = true
+    var tunEnable  = true
     var proxyEnable = false
     if modeTunOnly:
-      tunEnable = true
-      proxyEnable = false
+      tunEnable = true; proxyEnable = false
     elif modeTunProxy:
-      tunEnable = true
-      proxyEnable = true
+      tunEnable = true; proxyEnable = true
     elif modeProxyOnly:
-      tunEnable = false
-      proxyEnable = true
-    let n = configuration.generateReachableConfig(generateConfigPath, source, peerCount, listen, keyfile, tunEnable, proxyEnable)
-    echo "generated ", generateConfigPath, " with ", n, " reachable public peers; tun=", tunEnable, " proxy=", proxyEnable, " proxy listen=", listen
+      tunEnable = false; proxyEnable = true
+    # Build source lists from CLI flags or fall back to config-file values
+    var jsonUrls:    seq[string]
+    var githubRepos: seq[string]
+    if publicPeersSource.len > 0:
+      if publicPeersSource.startsWith("http") or fileExists(publicPeersSource):
+        jsonUrls.add publicPeersSource
+      else:
+        githubRepos.add publicPeersSource
+    # If nothing provided, the function will raise – let the error propagate
+    let n = configuration.generateReachableConfig(
+      generateConfigPath, jsonUrls, githubRepos,
+      peerCount, listen, keyfile, tunEnable, proxyEnable)
+    echo "generated ", generateConfigPath, " with ", n,
+         " reachable public peers; tun=", tunEnable,
+         " proxy=", proxyEnable, " proxy listen=", listen
     return
 
   echo "loading config from: ", configPath

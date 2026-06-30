@@ -15,6 +15,14 @@
 ##   - When only X25519 + Ed25519 are needed
 
 import std/dynlib
+import std/os
+
+when defined(windows):
+  const MonoLib* = "monocypher.dll"
+elif defined(macosx):
+  const MonoLib* = "libmonocypher.dylib"
+else:
+  const MonoLib* = "libmonocypher.so"
 
 type
   MonocypherError* = object of CatchableError
@@ -51,7 +59,17 @@ proc symRequired[T](lib: LibHandle, name: string): T =
 proc loadMonocypher*(): MonocypherApi =
   if cachedMono != nil: return cachedMono
   var lib: LibHandle
-  for name in ["libmonocypher.so", "libmonocypher.so.4", "libmonocypher.dylib", "monocypher.dll"]:
+
+  let appDir = getAppDir()
+  let besideBinary = appDir / MonoLib
+  if fileExists(besideBinary):
+    return besideBinary
+
+  let bundledLibDir = appDir / "lib" / MonoLib
+  if fileExists(bundledLibDir):
+    return bundledLibDir
+
+  for name in [MonoLib, "libmonocypher.so.4"]:
     lib = loadLib(name)
     if lib != nil: break
   if lib == nil: raise newException(MonocypherError, "Monocypher library not found")
@@ -135,14 +153,14 @@ proc ed25519PrivateToX25519*(edSecret: MonoKey64): MonoKey32 =
     var hash: array[64, byte]
     # In a real implementation we would call crypto_blake2b here.
     # For now we raise if the native helper is missing.
-    raise newException(MonocypherError, "Monocypher build does not expose ed25519->x25519 conversion helpers")
+    raise newException(MonocypherError, "Monocypher build does not expose ed25519 -> x25519 conversion helpers")
 
 proc ed25519PublicToX25519*(edPublic: MonoKey32): MonoKey32 =
   let api = loadMonocypher()
   if hasEdToX25519Conversion(api):
     api.crypto_from_ed25519_public(addr result[0], unsafeAddr edPublic[0])
   else:
-    raise newException(MonocypherError, "Monocypher build does not expose ed25519->x25519 conversion helpers")
+    raise newException(MonocypherError, "Monocypher build does not expose ed25519 -> x25519 conversion helpers")
 
 # ------------------------------------------------------------------
 # AEAD (XChaCha20-Poly1305)
