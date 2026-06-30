@@ -46,16 +46,16 @@ proc pipeToTls(args: PumpArgs) {.thread, gcsafe.} =
     if n <= 0: break
     var off = 0
     while off < n:
-      let wrote = wolfSSL_write(args.ssl, addr buf[off], cint(n - off))
+      let wrote = rawWriteWolfSSL(args.ssl, addr buf[off], n - off)
       if wrote <= 0: return
       off += wrote
 
 proc tlsToPipe(args: PumpArgs) {.thread, gcsafe.} =
   var buf: array[16384, byte]
   while true:
-    let n = wolfSSL_read(args.ssl, addr buf[0], cint(buf.len))
+    let n = rawReadWolfSSL(args.ssl, addr buf[0], buf.len)
     if n <= 0: break
-    if not writeAll(args.fd, addr buf[0], n.int): break
+    if not writeAll(args.fd, addr buf[0], n): break
 
 proc createTlsBridge*(config: TlsBridgeConfig): Option[tuple[state: TlsBridgeState, transport: StreamTransport]] =
   try:
@@ -99,11 +99,12 @@ proc createTlsBridge*(config: TlsBridgeConfig): Option[tuple[state: TlsBridgeSta
     echo "[TLS] WolfSSL bridge creation failed: ", e.msg
     return none(tuple[state: TlsBridgeState, transport: StreamTransport])
 
-proc close*(state: TlsBridgeState) =
+proc close*(state: TlsBridgeState) {.raises: [].} =
+  if state.isNil: return
   state.running = false
-  try: discard posix.shutdown(SocketHandle(state.pumpFd), SHUT_RDWR) except CatchableError: discard
-  try: discard posix.shutdown(SocketHandle(state.chronosFd), SHUT_RDWR) except CatchableError: discard
-  try: closeWolfSSL(state.wolfSess) except CatchableError: discard
-  try: discard posix.close(state.pumpFd) except CatchableError: discard
-  try: discard posix.close(state.chronosFd) except CatchableError: discard
-  try: state.wolfCtx.cleanupWolfSSL() except CatchableError: discard
+  try: discard posix.shutdown(SocketHandle(state.pumpFd), SHUT_RDWR) except Exception: discard
+  try: discard posix.shutdown(SocketHandle(state.chronosFd), SHUT_RDWR) except Exception: discard
+  try: closeWolfSSL(state.wolfSess) except Exception: discard
+  try: discard posix.close(state.pumpFd) except Exception: discard
+  try: discard posix.close(state.chronosFd) except Exception: discard
+  try: state.wolfCtx.cleanupWolfSSL() except Exception: discard

@@ -58,15 +58,17 @@ proc loadWolfSSL*(): bool =
   let appDir = getAppDir()
   let besideBinary = appDir / WolfSSLName
   if fileExists(besideBinary):
-    return besideBinary
+    gLib = loadLib(besideBinary)
 
-  let bundledLibDir = appDir / "lib" / WolfSSLName
-  if fileExists(bundledLibDir):
-    return bundledLibDir
+  if gLib == nil:
+    let bundledLibDir = appDir / "lib" / WolfSSLName
+    if fileExists(bundledLibDir):
+      gLib = loadLib(bundledLibDir)
 
-  for candidate in [WolfSSLName, "libwolfssl.so.45", "libwolfssl.so.23"]:
-    gLib = loadLib(candidate)
-    if gLib != nil: break
+  if gLib == nil:
+    for candidate in [WolfSSLName, "libwolfssl.so.45", "libwolfssl.so.23"]:
+      gLib = loadLib(candidate)
+      if gLib != nil: break
   if gLib == nil: raise newException(WolfSSLError, "WolfSSL library not found")
   try:
     wolf.init         = loadSym[typeof(wolf.init)](gLib, "wolfSSL_Init")
@@ -131,13 +133,21 @@ proc connectWolfSSL*(sess: var WolfSSLSession; sockFd: cint): bool =
   sess.connected = true
   true
 
+proc rawReadWolfSSL*(ssl: pointer; buf: pointer; maxLen: int): int {.gcsafe.} =
+  if ssl == nil: return -1
+  wolf.read(ssl, buf, cint(maxLen)).int
+
+proc rawWriteWolfSSL*(ssl: pointer; data: pointer; len: int): int {.gcsafe.} =
+  if ssl == nil: return -1
+  wolf.write(ssl, data, cint(len)).int
+
 proc readWolfSSL*(sess: WolfSSLSession; buf: pointer; maxLen: int): int =
   if not sess.connected: return -1
-  wolf.read(sess.ssl, buf, cint(maxLen)).int
+  rawReadWolfSSL(sess.ssl, buf, maxLen)
 
 proc writeWolfSSL*(sess: WolfSSLSession; data: pointer; len: int): int =
   if not sess.connected: return -1
-  wolf.write(sess.ssl, data, cint(len)).int
+  rawWriteWolfSSL(sess.ssl, data, len)
 
 proc closeWolfSSL*(sess: var WolfSSLSession) =
   if sess.ssl != nil:

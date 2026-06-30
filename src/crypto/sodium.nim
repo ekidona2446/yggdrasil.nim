@@ -57,15 +57,17 @@ proc loadSodium*(): SodiumApi =
   let appDir = getAppDir()
   let besideBinary = appDir / SodiumLib
   if fileExists(besideBinary):
-    return besideBinary
+    lib = loadLib(besideBinary)
 
-  let bundledLibDir = appDir / "lib" / SodiumLib
-  if fileExists(bundledLibDir):
-    return bundledLibDir
+  if lib == nil:
+    let bundledLibDir = appDir / "lib" / SodiumLib
+    if fileExists(bundledLibDir):
+      lib = loadLib(bundledLibDir)
 
-  for name in [SodiumLib, "libsodium.so.23"]:
-    lib = loadLib(name)
-    if lib != nil: break
+  if lib == nil:
+    for name in [SodiumLib, "libsodium.so.23"]:
+      lib = loadLib(name)
+      if lib != nil: break
   if lib == nil: raise newException(SodiumError, "libsodium not found (install libsodium23/libsodium-dev)")
 
   result = SodiumApi(lib: lib)

@@ -126,22 +126,22 @@ proc updateAnnounce*(r: var RouterState, ann: RouterAnnounce): bool =
   ## larger nonce wins. Accepted updates invalidate coordinate cache.
   let checkOk = ann.check()
   if not checkOk:
-    stderr.writeLine "[ironwood] updateAnnounce CHECK FAILED key=" & short(ann.key) & " seq=" & $ann.seq & " port=" & $ann.port
+    when defined(yggdebug): stderr.writeLine "[ironwood] updateAnnounce CHECK FAILED key=" & short(ann.key) & " seq=" & $ann.seq & " port=" & $ann.port
     return false
   if r.announces.hasKey(ann.key):
     let old = r.announces[ann.key]
     if old.seq > ann.seq:
-      stderr.writeLine "[ironwood] updateAnnounce REJECTED: old seq " & $old.seq & " > new seq " & $ann.seq & " key=" & short(ann.key)
+      when defined(yggdebug): stderr.writeLine "[ironwood] updateAnnounce REJECTED: old seq " & $old.seq & " > new seq " & $ann.seq & " key=" & short(ann.key)
       return false
     if old.seq == ann.seq:
       let pc = cmpNodeId(old.parent, ann.parent)
       if pc < 0:
-        stderr.writeLine "[ironwood] updateAnnounce REJECTED: same seq=" & $ann.seq & " old parent wins key=" & short(ann.key)
+        when defined(yggdebug): stderr.writeLine "[ironwood] updateAnnounce REJECTED: same seq=" & $ann.seq & " old parent wins key=" & short(ann.key)
         return false
       # CRDT tie-break (must match yggdrasil-go network/router._update):
       # for equal seq and equal parent, the *lower* nonce wins.
       if pc == 0 and ann.nonce >= old.nonce:
-        stderr.writeLine "[ironwood] updateAnnounce REJECTED: same seq=" & $ann.seq & " same parent, old nonce=" & $old.nonce & " new nonce=" & $ann.nonce & " key=" & short(ann.key)
+        when defined(yggdebug): stderr.writeLine "[ironwood] updateAnnounce REJECTED: same seq=" & $ann.seq & " same parent, old nonce=" & $old.nonce & " new nonce=" & $ann.nonce & " key=" & short(ann.key)
         return false
   r.announces[ann.key] = ann
   r.infoTimes[ann.key] = getTime()
@@ -216,7 +216,12 @@ proc greedyLookup*(r: var RouterState, path: Path, watermark: var uint64): Optio
       best = some(pid)
       bestDist = dist
       bestCost = cost
-  if best.isSome: watermark = bestDist
+  # Do NOT replace `watermark` with the selected peer distance. The wire
+  # watermark is the distance of the node that is forwarding the packet (this
+  # node), so the next hop can verify it is strictly closer before forwarding.
+  # Go's router._lookup updates the watermark to selfDist only; sending the
+  # selected peer's distance makes that peer drop PathNotify/Traffic as
+  # non-progressing (selfDist >= watermark).
   best
 
 proc markAnnounceSent(r: var RouterState, peerId: PeerId, key: NodeId) =
@@ -249,12 +254,14 @@ proc addPeer*(r: var RouterState, remoteKey: NodeId, priority: uint8 = 0): Route
   # direct peers without waiting for PathNotify.
   let peerAddr = deriveYggAddress(remoteKey)
   let peerPartial = keyPrefixForYggAddress(peerAddr)
+  let peerSubnetPartial = bloomTransform(remoteKey)
   r.keyMap[peerPartial] = remoteKey
+  r.keyMap[peerSubnetPartial] = remoteKey
   result.addEvent(rePeerAdded, "port=" & $port, some(id), some(remoteKey))
   result.outbound.add r.peers[id].action(makeKeepAlive())
   # Send SigReq to the new peer (makeSigReq records lastSigReqSeq/Nonce internally).
   let sigReqSeq = r.announces[r.crypto.publicKey].seq + 1
-  stderr.writeLine "[ironwood] addPeer key=" & toHex(remoteKey) & " port=" & $port & " sigReqSeq=" & $sigReqSeq
+  when defined(yggdebug): stderr.writeLine "[ironwood] addPeer key=" & toHex(remoteKey) & " port=" & $port & " sigReqSeq=" & $sigReqSeq
   result.outbound.add r.peers[id].action(r.peers[id].makeSigReq(sigReqSeq, randomNonce()))
   let bf = r.blooms.getBloomFor(remoteKey, r.crypto.publicKey)
   result.outbound.add r.peers[id].action(encodeFrame(ProtoBloomFilter, bf.encode()))
@@ -279,27 +286,33 @@ proc routeSessionData*(r: var RouterState, dest: NodeId, data: seq[byte], step: 
   ## (learned via PathNotify) or announce table, whichever is available.
   let selfCoords = r.cachedCoords(r.crypto.publicKey)
   let pathOpt = r.pathfinder.getPath(dest)
-  stderr.writeLine "[ironwood] routeSessionData dest=" & toHex(dest) & " pathfinderHasPath=" & $pathOpt.isSome & " pathfinderPaths=" & $r.pathfinder.paths.len & " pathfinderKeys="
+  when defined(yggdebug): stderr.writeLine "[ironwood] routeSessionData dest=" & toHex(dest) & " pathfinderHasPath=" & $pathOpt.isSome & " pathfinderPaths=" & $r.pathfinder.paths.len & " pathfinderKeys="
   for k in r.pathfinder.paths.keys:
-    stderr.write " " & short(k)
-  stderr.writeLine ""
+    when defined(yggdebug): stderr.write " " & short(k)
+  when defined(yggdebug): stderr.writeLine ""
   if pathOpt.isSome:
     ## We have a path from PathNotify — use greedy lookup on it.
     let path = pathOpt.get()
     # Compute OUR distance to the destination first (this is the watermark we
     # put in the traffic frame — the next hop must be strictly closer).
     let selfDist = r.distanceToKey(path, r.crypto.publicKey)
-    var watermark = selfDist
-    let gp = r.greedyLookup(path, watermark)
+    # IMPORTANT: greedyLookup() first compares our own distance with the input
+    # watermark and returns none if selfDist >= watermark. For locally-originated
+    # traffic there is no previous hop yet, so seed the search with infinity; the
+    # function will lower it to selfDist before considering peers. Seeding it
+    # with selfDist made every PathNotify-discovered route unusable and caused
+    # us to fall back to an empty announce path, which Go correctly rejected with
+    # ProtoPathBroken.
+    var searchWatermark = high(uint64)
+    let gp = r.greedyLookup(path, searchWatermark)
     if gp.isSome:
       let p = r.peers[gp.get()]
-      # watermark is now updated to the best peer's distance by greedyLookup.
-      # But we need to send selfDist as the watermark in the frame, because
-      # the watermark is the distance from the PREVIOUS hop to the destination.
-      # The next hop will update it to its own distance when it forwards.
+      # searchWatermark is now updated to the best peer's distance by
+      # greedyLookup. But the frame watermark must be selfDist because the next
+      # hop compares against the previous hop's distance and then updates it.
       let tr = TrafficPacket(path: path, fromPath: selfCoords, source: r.crypto.publicKey,
                        dest: dest, watermark: selfDist, payload: data)
-      stderr.writeLine "[ironwood] routeSessionData dest=" & short(dest) & " via peer=" & short(p.remoteKey) & " path=[" & coordToString(path) & "] self=[" & coordToString(selfCoords) & "] selfDist=" & $selfDist & " (pathfinder)"
+      when defined(yggdebug): stderr.writeLine "[ironwood] routeSessionData dest=" & short(dest) & " via peer=" & short(p.remoteKey) & " path=[" & coordToString(path) & "] self=[" & coordToString(selfCoords) & "] selfDist=" & $selfDist & " (pathfinder)"
       step.outbound.add p.action(encodeTrafficFrame(tr))
       return
   ## Fall back to announce-table based routing.
@@ -309,15 +322,15 @@ proc routeSessionData*(r: var RouterState, dest: NodeId, data: seq[byte], step: 
     let path2 = r.cachedCoords(dest)
     let selfPath = r.cachedCoords(r.crypto.publicKey)
     let selfDist = treeDistance(path2, selfPath)
-    stderr.writeLine "[ironwood] routeSessionData dest=" & short(dest) & " path2=[" & coordToString(path2) & "] selfPath=[" & coordToString(selfPath) & "] selfDist=" & $selfDist & " announces=" & $r.announces.len
+    when defined(yggdebug): stderr.writeLine "[ironwood] routeSessionData dest=" & short(dest) & " path2=[" & coordToString(path2) & "] selfPath=[" & coordToString(selfPath) & "] selfDist=" & $selfDist & " announces=" & $r.announces.len
     let tr = TrafficPacket(path: path2, fromPath: selfPath, source: r.crypto.publicKey,
                      dest: dest, watermark: selfDist, payload: data)
-    stderr.writeLine "[ironwood] routeSessionData dest=" & toHex(dest) & " via peer=" & short(p.remoteKey) & " pathLen=" & $path2.len & " selfDist=" & $selfDist & " (announce)"
+    when defined(yggdebug): stderr.writeLine "[ironwood] routeSessionData dest=" & toHex(dest) & " via peer=" & short(p.remoteKey) & " pathLen=" & $path2.len & " selfDist=" & $selfDist & " (announce)"
     step.outbound.add p.action(encodeTrafficFrame(tr))
     return
   step.addEvent(reNoRoute, "session dest=" & toHex(dest), key = some(dest))
-  stderr.writeLine "[ironwood] routeSessionData dest=" & toHex(dest) & " NO ROUTE"
-  discard r.pathfinder.ensureRumor(bloomTransform(dest))
+  when defined(yggdebug): stderr.writeLine "[ironwood] routeSessionData dest=" & toHex(dest) & " NO ROUTE"
+  discard r.pathfinder.ensureRumor(dest)
 
 proc sendPathNotifyTo*(r: var RouterState, peerId: PeerId, requester: NodeId, requestedSource: NodeId,
                        returnPath: Path): seq[FrameAction] =
@@ -330,7 +343,7 @@ proc sendPathNotifyTo*(r: var RouterState, peerId: PeerId, requester: NodeId, re
   let info = PathNotifyInfo(seq: uint64(epochTime()), path: ownPath, signature: sig)
   let notify = PathNotify(path: returnPath, watermark: high(uint64), source: requestedSource,
                           dest: requester, info: info)
-  stderr.writeLine "[ironwood] sendPathNotify requester=" & toHex(requester) & " returnPath=" & coordToString(returnPath) & " ownPath=" & coordToString(ownPath)
+  when defined(yggdebug): stderr.writeLine "[ironwood] sendPathNotify requester=" & toHex(requester) & " returnPath=" & coordToString(returnPath) & " ownPath=" & coordToString(ownPath)
   # Route the notify back towards the requester using greedy lookup on returnPath.
   var watermark = notify.watermark
   let pid = r.greedyLookup(notify.path, watermark)
@@ -348,7 +361,7 @@ proc sendLookup*(r: var RouterState, dest: NodeId): RouterStep =
   r.pathfinder.markLookupSent(dest)
   let fromCoords = r.cachedCoords(r.crypto.publicKey)
   let lookup = PathLookup(source: r.crypto.publicKey, dest: dest, fromPath: fromCoords)
-  stderr.writeLine "[ironwood] sendLookup dest=" & toHex(dest) & " fromCoords=" & coordToString(fromCoords) & " ourAnnounces=" & $r.announces.len
+  when defined(yggdebug): stderr.writeLine "[ironwood] sendLookup dest=" & toHex(dest) & " fromCoords=" & coordToString(fromCoords) & " ourAnnounces=" & $r.announces.len
   var sent = 0
   if r.peerByKey.hasKey(dest):
     let pid = r.peerByKey[dest]
@@ -402,7 +415,7 @@ proc adoptParent(r: var RouterState, parent: NodeId, res: SigResFull): bool =
   if ok:
     # Track the seq so future SigReqs use at least seq+1
     r.ownSeq = max(r.ownSeq, res.seq + 1)
-  stderr.writeLine "[ironwood] adoptParent parent=" & short(parent) & " seq=" & $res.seq & " port=" & $res.port & " accepted=" & $ok
+  when defined(yggdebug): stderr.writeLine "[ironwood] adoptParent parent=" & short(parent) & " seq=" & $res.seq & " port=" & $res.port & " accepted=" & $ok
   ok
 
 proc becomeRoot(r: var RouterState): bool =
@@ -411,7 +424,7 @@ proc becomeRoot(r: var RouterState): bool =
   r.ownSeq = newSeq + 1
   let ann = makeRootAnnounce(r.crypto, newSeq, randomNonce())
   let ok = r.updateAnnounce(ann)
-  stderr.writeLine "[ironwood] becomeRoot seq=" & $newSeq & " accepted=" & $ok
+  when defined(yggdebug): stderr.writeLine "[ironwood] becomeRoot seq=" & $newSeq & " accepted=" & $ok
   ok
 
 proc expireInfos*(r: var RouterState) =
@@ -524,7 +537,7 @@ proc maintenance*(r: var RouterState): RouterStep =
     r.lastRefresh = getTime()
   let (myRoot, myCoords) = r.rootAndPath(r.crypto.publicKey)
   when defined(yggdebug):
-    stderr.writeLine "[STATE] root=" & toHex(myRoot) & " coords=[" & myCoords.join(",") & "] parent=" & toHex(r.currentParent()) & " announces=" & $r.announces.len & " peers=" & $r.peers.len
+    when defined(yggdebug): stderr.writeLine "[STATE] root=" & toHex(myRoot) & " coords=[" & myCoords.join(",") & "] parent=" & toHex(r.currentParent()) & " announces=" & $r.announces.len & " peers=" & $r.peers.len
   let fix = r.fixParent()
   result.outbound.add fix.outbound
   result.events.add fix.events
@@ -567,12 +580,12 @@ proc sendAppData*(r: var RouterState, dest: NodeId, data: openArray[byte]): Rout
   let hasPath = r.pathfinder.hasPath(actualDest)
   let isDirectPeer = r.peerByKey.hasKey(actualDest)
   if not hasPath and not isDirectPeer:
-    stderr.writeLine "[ironwood] sendAppData dest=" & short(dest) & " actualDest=" & short(actualDest) & " resolved=" & $resolved & " hasPath=" & $hasPath & " isDirectPeer=" & $isDirectPeer & " keyMapSize=" & $r.keyMap.len & " no path, sending lookup"
+    when defined(yggdebug): stderr.writeLine "[ironwood] sendAppData dest=" & short(dest) & " actualDest=" & short(actualDest) & " resolved=" & $resolved & " hasPath=" & $hasPath & " isDirectPeer=" & $isDirectPeer & " keyMapSize=" & $r.keyMap.len & " no path, sending lookup"
     result = r.sendLookup(actualDest)
     result.addEvent(reNoRoute, "queued lookup before app data", key = some(dest))
     return
   let actions = r.sessions.writeTo(toEdPublic(actualDest), data)
-  stderr.writeLine "[ironwood] sendAppData dest=" & short(dest) & " actualDest=" & short(actualDest) & " resolved=" & $resolved & " keyMapSize=" & $r.keyMap.len & " sessionActions=" & $actions.len & " dataLen=" & $data.len
+  when defined(yggdebug): stderr.writeLine "[ironwood] sendAppData dest=" & short(dest) & " actualDest=" & short(actualDest) & " resolved=" & $resolved & " keyMapSize=" & $r.keyMap.len & " sessionActions=" & $actions.len & " dataLen=" & $data.len
   for a in actions:
     case a.kind
     of oaSendToInner: r.routeSessionData(toNodeId(a.dest), a.data, result)
@@ -580,36 +593,39 @@ proc sendAppData*(r: var RouterState, dest: NodeId, data: openArray[byte]): Rout
 
 proc handleTraffic(r: var RouterState, tr: TrafficPacket, step: var RouterStep) =
   if tr.dest == r.crypto.publicKey:
-    stderr.writeLine "[ironwood] handleTraffic FOR US src=" & short(tr.source) & " payloadLen=" & $tr.payload.len & " firstByte=" & (if tr.payload.len > 0: "0x" & toHex(tr.payload[0]) else: "empty") & " fullPayload=" & toHex(tr.payload)
+    when defined(yggdebug): stderr.writeLine "[ironwood] handleTraffic FOR US src=" & short(tr.source) & " payloadLen=" & $tr.payload.len & " firstByte=" & (if tr.payload.len > 0: "0x" & toHex(tr.payload[0]) else: "empty") & " fullPayload=" & toHex(tr.payload)
     let acts = r.sessions.handleData(toEdPublic(tr.source), tr.payload)
-    stderr.writeLine "[ironwood] handleData returned " & $acts.len & " actions"
+    when defined(yggdebug): stderr.writeLine "[ironwood] handleData returned " & $acts.len & " actions"
     for i, a in acts:
-      stderr.writeLine "[ironwood]   action[" & $i & "] kind=" & $a.kind & " dataLen=" & $a.data.len
+      when defined(yggdebug): stderr.writeLine "[ironwood]   action[" & $i & "] kind=" & $a.kind & " dataLen=" & $a.data.len
     for a in acts:
       case a.kind
       of oaDeliver:
         step.deliveries.add AppDelivery(source: toNodeId(a.source), data: a.data)
         step.addEvent(reTrafficDelivered, "bytes=" & $a.data.len, key = some(toNodeId(a.source)))
-        stderr.writeLine "[ironwood] traffic delivered src=" & toHex(toNodeId(a.source)) & " bytes=" & $a.data.len
+        when defined(yggdebug): stderr.writeLine "[ironwood] traffic delivered src=" & toHex(toNodeId(a.source)) & " bytes=" & $a.data.len
       of oaSendToInner:
         r.routeSessionData(toNodeId(a.dest), a.data, step)
   else:
-    var routed = false
-    if tr.path.len > 0:
-      var watermark = tr.watermark
-      let gp = r.greedyLookup(tr.path, watermark)
-      if gp.isSome:
-        var fwd = tr
-        fwd.watermark = watermark
-        step.outbound.add r.peers[gp.get()].action(encodeTrafficFrame(fwd))
-        routed = true
-    if not routed:
-      let pid = r.bestPeerForKey(tr.dest)
-      if pid.isSome:
-        step.outbound.add r.peers[pid.get()].action(encodeTrafficFrame(tr))
-        routed = true
-    if not routed:
-      step.addEvent(reNoRoute, "traffic dest=" & toHex(tr.dest), key = some(tr.dest))
+    when defined(yggTransit):
+      var routed = false
+      if tr.path.len > 0:
+        var watermark = tr.watermark
+        let gp = r.greedyLookup(tr.path, watermark)
+        if gp.isSome:
+          var fwd = tr
+          fwd.watermark = watermark
+          step.outbound.add r.peers[gp.get()].action(encodeTrafficFrame(fwd))
+          routed = true
+      if not routed:
+        let pid = r.bestPeerForKey(tr.dest)
+        if pid.isSome:
+          step.outbound.add r.peers[pid.get()].action(encodeTrafficFrame(tr))
+          routed = true
+      if not routed:
+        step.addEvent(reNoRoute, "traffic dest=" & toHex(tr.dest), key = some(tr.dest))
+    else:
+      step.addEvent(reNoRoute, "transit traffic disabled dest=" & toHex(tr.dest), key = some(tr.dest))
 
 proc handleFrame*(r: var RouterState, peerId: PeerId, frame: Frame): RouterStep =
   if not r.peers.hasKey(peerId):
@@ -640,10 +656,10 @@ proc handleFrame*(r: var RouterState, peerId: PeerId, frame: Frame): RouterStep 
           # Bump our seq to be strictly higher, matching Go ironwood's
           # behaviour when it detects a stale self-announce.
           r.ownSeq = ann.seq + 1
-        stderr.writeLine "[ironwood] announce key=self (skipped, ownSeq=" & $r.ownSeq & ") parent=" & toHex(ann.parent) & " seq=" & $ann.seq & " port=" & $ann.port
+        when defined(yggdebug): stderr.writeLine "[ironwood] announce key=self (skipped, ownSeq=" & $r.ownSeq & ") parent=" & toHex(ann.parent) & " seq=" & $ann.seq & " port=" & $ann.port
       else:
         let accepted = r.updateAnnounce(ann)
-        stderr.writeLine "[ironwood] announce key=" & short(ann.key) & " parent=" & short(ann.parent) & " seq=" & $ann.seq & " port=" & $ann.port & " accepted=" & $accepted
+        when defined(yggdebug): stderr.writeLine "[ironwood] announce key=" & short(ann.key) & " parent=" & short(ann.parent) & " seq=" & $ann.seq & " port=" & $ann.port & " accepted=" & $accepted
         if accepted:
           r.blooms.setOnTree(remoteKey, true)
           ## Populate keyMap: derive the partial key from the announced node's
@@ -654,7 +670,9 @@ proc handleFrame*(r: var RouterState, peerId: PeerId, frame: Frame): RouterStep 
           ## needed for encrypted session routing.
           let annAddr = deriveYggAddress(ann.key)
           let annPartial = keyPrefixForYggAddress(annAddr)
+          let annSubnetPartial = bloomTransform(ann.key)
           r.keyMap[annPartial] = ann.key
+          r.keyMap[annSubnetPartial] = ann.key
           result.addEvent(reAnnounceStored, "parent=" & toHex(ann.parent), some(peerId), some(ann.key))
           ## Gossip newly accepted announcements to other direct peers.
           for pid, p in r.peers:
@@ -665,13 +683,13 @@ proc handleFrame*(r: var RouterState, peerId: PeerId, frame: Frame): RouterStep 
     let sr = decodeSigResFull(frame.payload)
     if sr.isSome:
       r.responses[remoteKey] = sr.get().value
-      stderr.writeLine "[ironwood] sigres from=" & toHex(remoteKey) & " seq=" & $sr.get().value.seq & " port=" & $sr.get().value.port
+      when defined(yggdebug): stderr.writeLine "[ironwood] sigres from=" & toHex(remoteKey) & " seq=" & $sr.get().value.seq & " port=" & $sr.get().value.port
   of ProtoBloomFilter:
     let bf = decodeBloomFilter(frame.payload)
     if bf.isSome:
       r.blooms.handleBloom(remoteKey, bf.get())
       r.blooms.setOnTree(remoteKey, true)
-      stderr.writeLine "[ironwood] bloom from=" & toHex(remoteKey) & " ones=" & $bf.get().countOnes() & " announces=" & $r.announces.len
+      when defined(yggdebug): stderr.writeLine "[ironwood] bloom from=" & toHex(remoteKey) & " ones=" & $bf.get().countOnes() & " announces=" & $r.announces.len
       result.addEvent(reBloomUpdated, "ones=" & $bf.get().countOnes(), some(peerId), some(remoteKey))
   of ProtoPathLookup:
     let l = decodePathLookup(frame.payload)
@@ -682,47 +700,54 @@ proc handleFrame*(r: var RouterState, peerId: PeerId, frame: Frame): RouterStep 
       let destAddr = deriveYggAddress(l.get().dest)
       let isForUs = ourXform == destXform
       if isForUs:
-        stderr.writeLine "[ironwood] PathLookup FOR US from=" & toHex(l.get().source) & " dest=" & toHex(l.get().dest) & " MATCH"
+        when defined(yggdebug): stderr.writeLine "[ironwood] PathLookup FOR US from=" & toHex(l.get().source) & " dest=" & toHex(l.get().dest) & " MATCH"
       result.addEvent(rePathLookupReceived, "dest=" & toHex(l.get().dest), some(peerId), some(l.get().source))
       if isForUs:
         let replies = r.sendPathNotifyTo(peerId, l.get().source, r.crypto.publicKey, l.get().fromPath)
         for reply in replies: result.outbound.add reply
       else:
-        let targets = r.blooms.getMulticastTargets(remoteKey, l.get().dest)
-        for t in targets:
-          if r.peerByKey.hasKey(t):
-            let pid = r.peerByKey[t]
-            result.outbound.add r.peers[pid].action(encodeFrame(ProtoPathLookup, frame.payload))
+        # Client mode: do not forward other nodes' multicast path lookups by
+        # default. Forwarding every public lookup can turn a lightweight client
+        # into a transit router and quickly fill memory/queues. Compile with
+        # -d:yggTransit to participate in transit forwarding.
+        when defined(yggTransit):
+          let targets = r.blooms.getMulticastTargets(remoteKey, l.get().dest)
+          for t in targets:
+            if r.peerByKey.hasKey(t):
+              let pid = r.peerByKey[t]
+              result.outbound.add r.peers[pid].action(encodeFrame(ProtoPathLookup, frame.payload))
   of ProtoPathNotify:
     let n = decodePathNotify(frame.payload)
     if n.isSome:
-      stderr.writeLine "[ironwood] PathNotify from=" & toHex(n.get().source) & " dest=" & toHex(n.get().dest) & " pathLen=" & $n.get().info.path.len
+      when defined(yggdebug): stderr.writeLine "[ironwood] PathNotify from=" & toHex(n.get().source) & " dest=" & toHex(n.get().dest) & " pathLen=" & $n.get().info.path.len
       if n.get().dest == r.crypto.publicKey:
         if r.pathfinder.acceptNotify(n.get()):
-          ## Map the address-derived partial key to the responder's full key.
-          ## keyPrefixForYggAddress returns a 32-byte key where only the first
-          ## ~16 bytes are meaningful (derived from the IPv6 address); the rest
-          ## are set to 0xFF. We store the full 32-byte partial key from the
-          ## responder's address for exact matching.
+          ## Map both node-address and routed-subnet partial keys to the
+          ## responder's full key, like Go's keyStore.update() updates both
+          ## addrToInfo and subnetToInfo. 200::/7 traffic uses Address.GetKey;
+          ## 300::/7 subnet traffic uses Subnet.GetKey/bloomTransform.
           let responderAddr = deriveYggAddress(n.get().source)
-          let partialKey = keyPrefixForYggAddress(responderAddr)
-          r.keyMap[partialKey] = n.get().source
-          stderr.writeLine "[ironwood] PathNotify ACCEPTED source=" & toHex(n.get().source) & " pathLen=" & $n.get().info.path.len & " partial=" & toHex(partialKey) & " keyMapSize=" & $r.keyMap.len
+          let addressPartial = keyPrefixForYggAddress(responderAddr)
+          let subnetPartial = bloomTransform(n.get().source)
+          r.keyMap[addressPartial] = n.get().source
+          r.keyMap[subnetPartial] = n.get().source
+          when defined(yggdebug): stderr.writeLine "[ironwood] PathNotify ACCEPTED source=" & toHex(n.get().source) & " pathLen=" & $n.get().info.path.len & " addressPartial=" & toHex(addressPartial) & " subnetPartial=" & toHex(subnetPartial) & " keyMapSize=" & $r.keyMap.len
           result.addEvent(rePathNotifyAccepted, "source=" & toHex(n.get().source), some(peerId), some(n.get().source))
       else:
-        var pid: Option[PeerId]
-        if r.peerByKey.hasKey(n.get().dest):
-          pid = some(r.peerByKey[n.get().dest])
-        else:
-          var watermark = n.get().watermark
-          pid = r.greedyLookup(n.get().path, watermark)
+        when defined(yggTransit):
+          var pid: Option[PeerId]
+          if r.peerByKey.hasKey(n.get().dest):
+            pid = some(r.peerByKey[n.get().dest])
+          else:
+            var watermark = n.get().watermark
+            pid = r.greedyLookup(n.get().path, watermark)
+            if pid.isSome:
+              var fwd = n.get()
+              fwd.watermark = watermark
+              result.outbound.add r.peers[pid.get()].action(encodeFrame(ProtoPathNotify, encodePathNotify(fwd)))
+              pid = none(PeerId)
           if pid.isSome:
-            var fwd = n.get()
-            fwd.watermark = watermark
-            result.outbound.add r.peers[pid.get()].action(encodeFrame(ProtoPathNotify, encodePathNotify(fwd)))
-            pid = none(PeerId)
-        if pid.isSome:
-          result.outbound.add r.peers[pid.get()].action(encodeFrame(ProtoPathNotify, frame.payload))
+            result.outbound.add r.peers[pid.get()].action(encodeFrame(ProtoPathNotify, frame.payload))
   of ProtoPathBroken:
     let b = decodePathBroken(frame.payload)
     if b.isSome:
@@ -738,7 +763,7 @@ proc handleFrame*(r: var RouterState, peerId: PeerId, frame: Frame): RouterStep 
   of Traffic:
     let tr = decodeTraffic(frame.payload)
     if tr.isSome:
-      stderr.writeLine "[ironwood] traffic from=" & toHex(tr.get().source) & " dest=" & toHex(tr.get().dest) & " pathLen=" & $tr.get().path.len & " payloadLen=" & $tr.get().payload.len
+      when defined(yggdebug): stderr.writeLine "[ironwood] traffic from=" & toHex(tr.get().source) & " dest=" & toHex(tr.get().dest) & " pathLen=" & $tr.get().path.len & " payloadLen=" & $tr.get().payload.len
       r.handleTraffic(tr.get(), result)
   else:
     discard

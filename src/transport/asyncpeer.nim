@@ -122,7 +122,7 @@ proc readerLoop(peer: AsyncPeer) {.async.} =
     try:
       let frame = await readFrameFromReader(peer.reader)
       if frame.packetType in {ProtoPathBroken, Traffic}:
-        stderr.writeLine "[asyncpeer] recv peer=" & short(peer.remoteKey) & " type=" & $frame.packetType & " payloadLen=" & $frame.payload.len
+        when defined(yggdebug): stderr.writeLine "[asyncpeer] recv peer=" & short(peer.remoteKey) & " type=" & $frame.packetType & " payloadLen=" & $frame.payload.len
       peer.lastReceived = getMonoTime()
       
       let msg = RouterMessage(
@@ -138,18 +138,21 @@ proc readerLoop(peer: AsyncPeer) {.async.} =
     except CancelledError:
       break
     except CatchableError as e:
-      stderr.writeLine "[asyncpeer] reader error peer=" & short(peer.remoteKey) & ": " & e.msg
+      when defined(yggdebug): stderr.writeLine "[asyncpeer] reader error peer=" & short(peer.remoteKey) & ": " & e.msg
       break
 
 proc writerLoop(peer: AsyncPeer) {.async.} =
   let keepalive = encodeFrame(KeepAlive, [])
+  var pendingRecv: Future[seq[byte]] = nil
   
   while peer.running:
     let sleepFut = sleepAsync(chronos.milliseconds(KeepaliveIntervalMs))
-    let recvFut = peer.writerQueue.popFirst()
+    let recvFut = if pendingRecv != nil: pendingRecv else: peer.writerQueue.popFirst()
+    pendingRecv = nil
     let completed = await race(recvFut, sleepFut)
     
     if completed == recvFut:
+      if not sleepFut.finished: sleepFut.cancelSoon()
       let frameData = recvFut.read()
       try:
         var ptOff = 0
@@ -157,16 +160,19 @@ proc writerLoop(peer: AsyncPeer) {.async.} =
         ptOff.inc
         let pType = if ptOff < frameData.len: frameData[ptOff] else: 0'u8
         if pType in {5'u8, 6'u8, 7'u8, 9'u8}:
-          stderr.writeLine "[asyncpeer] WRITE type=" & $pType & " len=" & $frameData.len & " peer=" & short(peer.remoteKey)
+          when defined(yggdebug): stderr.writeLine "[asyncpeer] WRITE type=" & $pType & " len=" & $frameData.len & " peer=" & short(peer.remoteKey)
         await peer.writer.write(frameData)
       except CatchableError as e:
-        stderr.writeLine "[asyncpeer] writer error peer=" & short(peer.remoteKey) & ": " & e.msg
+        when defined(yggdebug): stderr.writeLine "[asyncpeer] writer error peer=" & short(peer.remoteKey) & ": " & e.msg
         break
     else:
+      pendingRecv = recvFut
       try:
         await peer.writer.write(keepalive)
       except CatchableError:
         break
+  if pendingRecv != nil and not pendingRecv.finished:
+    pendingRecv.cancelSoon()
 
 proc run*(peer: AsyncPeer) {.async.} =
   peer.running = true

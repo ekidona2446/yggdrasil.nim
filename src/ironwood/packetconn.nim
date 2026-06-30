@@ -182,7 +182,7 @@ proc routerActorLoop(pc: PacketConn) {.async.} =
             stderr.writeLine "[packetconn] tick error: " & e.msg
           inc tickCount
           if tickCount mod 10 == 0:
-            stderr.writeLine "[packetconn] actor loop alive, tick=" & $tickCount & " keyMap=" & $pc.state.keyMap.len & " announces=" & $pc.state.announces.len & " peers=" & $pc.state.peers.len & " pendingRecv=" & $(pendingRecv != nil)
+            when defined(yggdebug): stderr.writeLine "[packetconn] actor loop alive, tick=" & $tickCount & " keyMap=" & $pc.state.keyMap.len & " announces=" & $pc.state.announces.len & " peers=" & $pc.state.peers.len & " pendingRecv=" & $(pendingRecv != nil)
           lastTick = getMonoTime()
     except CatchableError as e:
       stderr.writeLine "[packetconn] actorLoop outer error: " & e.msg
@@ -196,7 +196,7 @@ proc readFrom*(pc: PacketConn, buf: ptr byte, bufLen: int): Future[(int, NodeId)
   result = (n, delivery.source)
 
 proc writeTo*(pc: PacketConn, dest: NodeId, data: seq[byte]): Future[void] {.async.} = 
-  stderr.writeLine "[packetconn] writeTo dest=" & short(dest) & " dataLen=" & $data.len
+  when defined(yggdebug): stderr.writeLine "[packetconn] writeTo dest=" & short(dest) & " dataLen=" & $data.len
   let msg = RouterMessage(
     kind: rmSendTraffic,
     traffic: TrafficPacket(
@@ -246,10 +246,10 @@ proc handleConn*(pc: PacketConn, peerKey: NodeId, transport: StreamTransport,
   if pc.pendingOutbound.hasKey(pid):
     let count = pc.pendingOutbound[pid].len
     for i, frame in pc.pendingOutbound[pid]:
-      stderr.writeLine "[packetconn] flushing frame[" & $i & "] len=" & $frame.len & " firstBytes=" & (if frame.len >= 2: $frame[0] & "," & $frame[1] else: $frame[0]) & " for peer=" & short(peerKey)
+      when defined(yggdebug): stderr.writeLine "[packetconn] flushing frame[" & $i & "] len=" & $frame.len & " firstBytes=" & (if frame.len >= 2: $frame[0] & "," & $frame[1] else: $frame[0]) & " for peer=" & short(peerKey)
       peer.sendFrame(frame)
     pc.pendingOutbound.del(pid)
-    stderr.writeLine "[packetconn] flushed " & $count & " pending frames for peer=" & short(peerKey)
+    when defined(yggdebug): stderr.writeLine "[packetconn] flushed " & $count & " pending frames for peer=" & short(peerKey)
   
   try:
     await peer.run()
@@ -297,7 +297,7 @@ proc handleConnStream*(pc: PacketConn, peerKey: NodeId,
     for frame in pc.pendingOutbound[pid]:
       peer.sendFrame(frame)
     pc.pendingOutbound.del(pid)
-    stderr.writeLine "[packetconn] flushed " & $count & " pending frames for stream peer=" & short(peerKey)
+    when defined(yggdebug): stderr.writeLine "[packetconn] flushed " & $count & " pending frames for stream peer=" & short(peerKey)
   
   try:
     await peer.run()

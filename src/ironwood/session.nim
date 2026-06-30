@@ -305,7 +305,7 @@ proc writeTo*(m: var SessionManager, dest: Ed25519PublicKey, msg: openArray[byte
     var s = m.sessions[dest]
     let data = s.doSend(msg)
     m.sessions[dest] = s
-    stderr.writeLine "[session] writeTo existing session dest=", short(toNodeId(dest)), " msgLen=", msg.len, " encLen=", data.len
+    when defined(yggdebug): stderr.writeLine "[session] writeTo existing session dest=", short(toNodeId(dest)), " msgLen=", msg.len, " encLen=", data.len
     return @[OutAction(kind: oaSendToInner, dest: dest, data: data)]
   var buf: SessionBuffer
   let hadBuffer = m.buffers.hasKey(dest)
@@ -319,16 +319,16 @@ proc writeTo*(m: var SessionManager, dest: Ed25519PublicKey, msg: openArray[byte
   for i in 0 ..< msg.len: buf.data[i] = msg[i]
   buf.hasData = true
   m.buffers[dest] = buf
-  stderr.writeLine "[session] writeTo NEW session dest=", short(toNodeId(dest)), " msgLen=", msg.len, " hadBuffer=", hadBuffer, " initLen=", buf.init.encrypt(m.local, dest, SessionTypeInit).len
+  when defined(yggdebug): stderr.writeLine "[session] writeTo NEW session dest=", short(toNodeId(dest)), " msgLen=", msg.len, " hadBuffer=", hadBuffer, " initLen=", buf.init.encrypt(m.local, dest, SessionTypeInit).len
   @[OutAction(kind: oaSendToInner, dest: dest, data: buf.init.encrypt(m.local, dest, SessionTypeInit))]
 
 proc handleData*(m: var SessionManager, fromKey: Ed25519PublicKey, data: openArray[byte]): seq[OutAction] =
   if data.len == 0: return @[]
-  stderr.writeLine "[session] handleData from=", short(toNodeId(fromKey)), " firstByte=", $data[0], " dataLen=", $data.len, " sessions=", $m.sessions.len, " buffers=", $m.buffers.len
+  when defined(yggdebug): stderr.writeLine "[session] handleData from=", short(toNodeId(fromKey)), " firstByte=", $data[0], " dataLen=", $data.len, " sessions=", $m.sessions.len, " buffers=", $m.buffers.len
   case data[0]
   of SessionTypeInit:
     let init = decryptSessionInit(data, m.localCurveSk, fromKey)
-    stderr.writeLine "[session] Init from ", short(toNodeId(fromKey)), " decryptOk=", init.isSome
+    when defined(yggdebug): stderr.writeLine "[session] Init from ", short(toNodeId(fromKey)), " decryptOk=", init.isSome
     if init.isNone: return @[]
     var made = m.createSessionFromInit(fromKey, init.get().init)
     var info = made.info
@@ -337,32 +337,39 @@ proc handleData*(m: var SessionManager, fromKey: Ed25519PublicKey, data: openArr
     # IMPORTANT: Send Ack BEFORE buffered data, so peer can set up session first
     result.add OutAction(kind: oaSendToInner, dest: fromKey, data: ack.encrypt(m.local, fromKey, SessionTypeAck))
     if made.buffer.isSome:
-      result.add OutAction(kind: oaSendToInner, dest: fromKey, data: info.doSend(made.buffer.get()))
+      let encData = info.doSend(made.buffer.get())
+      # doSend advances the send nonce; persist it or the next packet would
+      # reuse nonce=1 and be rejected by Go/Rust peers as a replay.
+      m.sessions[fromKey] = info
+      result.add OutAction(kind: oaSendToInner, dest: fromKey, data: encData)
   of SessionTypeAck:
     let ack = decryptSessionInit(data, m.localCurveSk, fromKey)
     if ack.isNone: return @[]
-    stderr.writeLine "[session] Ack from ", short(toNodeId(fromKey)), " decryptOk=true hasSession=", m.sessions.hasKey(fromKey), " hasBuffer=", m.buffers.hasKey(fromKey), " ackKeySeq=", ack.get().init.keySeq, " ackSeq=", ack.get().init.seq
+    when defined(yggdebug): stderr.writeLine "[session] Ack from ", short(toNodeId(fromKey)), " decryptOk=true hasSession=", m.sessions.hasKey(fromKey), " hasBuffer=", m.buffers.hasKey(fromKey), " ackKeySeq=", ack.get().init.keySeq, " ackSeq=", ack.get().init.seq
     if m.sessions.hasKey(fromKey):
       # Re-ack for existing session. Match Go's handleAck.
       var info = m.sessions[fromKey]
       if ack.get().init.seq > info.seq:
         info.handleUpdate(ack.get().init)
         m.sessions[fromKey] = info
-        stderr.writeLine "[session] Ack handleUpdate for existing session"
+        when defined(yggdebug): stderr.writeLine "[session] Ack handleUpdate for existing session"
     else:
       # First Ack after we sent Init.
       # In Go: _handleAck → _sessionForInit → handleInit → _handleUpdate + _sendAck.
       # We do the same but skip sending Ack back (would loop).
       var made = m.createSessionFromInit(fromKey, ack.get().init)
-      stderr.writeLine "[session] Ack created session ackKeySeq=", ack.get().init.keySeq, " ackSeq=", ack.get().init.seq, " infoSeq=", made.info.seq, " willUpdate=", (ack.get().init.seq > made.info.seq)
+      when defined(yggdebug): stderr.writeLine "[session] Ack created session ackKeySeq=", ack.get().init.keySeq, " ackSeq=", ack.get().init.seq, " infoSeq=", made.info.seq, " willUpdate=", (ack.get().init.seq > made.info.seq)
       if ack.get().init.seq > made.info.seq:
         made.info.handleUpdate(ack.get().init)
       m.sessions[fromKey] = made.info
-      stderr.writeLine "[session] KEYS: current=", toHex(made.info.current), " next=", toHex(made.info.next), " sendPub=", toHex(made.info.sendPub), " recvPub=", toHex(made.info.recvPub), " nextPub=", toHex(made.info.nextPub), " localKeySeq=", made.info.localKeySeq, " remoteKeySeq=", made.info.remoteKeySeq
+      when defined(yggdebug): stderr.writeLine "[session] KEYS: current=", toHex(made.info.current), " next=", toHex(made.info.next), " sendPub=", toHex(made.info.sendPub), " recvPub=", toHex(made.info.recvPub), " nextPub=", toHex(made.info.nextPub), " localKeySeq=", made.info.localKeySeq, " remoteKeySeq=", made.info.remoteKeySeq
       # Send buffered data
       if made.buffer.isSome:
         let encData = made.info.doSend(made.buffer.get())
-        stderr.writeLine "[session] Ack: sending buffered data len=", encData.len, " localKeySeq=", made.info.localKeySeq, " remoteKeySeq=", made.info.remoteKeySeq, " sendNonce=", made.info.sendNonce
+        # Persist the send nonce advanced by doSend; otherwise every packet
+        # after the buffered one can reuse a nonce and stall TCP streams.
+        m.sessions[fromKey] = made.info
+        when defined(yggdebug): stderr.writeLine "[session] Ack: sending buffered data len=", encData.len, " localKeySeq=", made.info.localKeySeq, " remoteKeySeq=", made.info.remoteKeySeq, " sendNonce=", made.info.sendNonce
         result.add OutAction(kind: oaSendToInner, dest: fromKey, data: encData)
 
   of SessionTypeTraffic:
@@ -370,7 +377,7 @@ proc handleData*(m: var SessionManager, fromKey: Ed25519PublicKey, data: openArr
     var info = m.sessions[fromKey]
     let plain = info.doRecv(data)
     m.sessions[fromKey] = info
-    stderr.writeLine "[session] Traffic from ", short(toNodeId(fromKey)), " decryptOk=", plain.isSome
+    when defined(yggdebug): stderr.writeLine "[session] Traffic from ", short(toNodeId(fromKey)), " decryptOk=", plain.isSome
     if plain.isSome: result.add OutAction(kind: oaDeliver, source: fromKey, data: plain.get())
   else:
     discard

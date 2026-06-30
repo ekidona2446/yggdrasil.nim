@@ -54,10 +54,19 @@ proc tunToOverlay(tun: TunAdapter, pc: PacketConn) {.async.} =
         var destAddr: IPv6Address
         for i in 0 ..< 16: destAddr[i] = packet[24 + i]
         if destAddr[0] notin {0x02'u8, 0x03'u8}:
-          # Not a Yggdrasil unicast address (200::/7 or 300::/7); drop.
+          # Not a Yggdrasil address/subnet (200::/7 or 300::/7); drop.
           continue
-        destKey = keyPrefixForYggAddress(destAddr)
-        stderr.writeLine "[dataplane] TUN -> overlay dest=" & toIPv6String(destAddr) & " pktLen=" & $packet.len & " destAddr0=0x" & toHex(destAddr[0]) & " destKey=" & toHex(destKey)
+        if (destAddr[0] and 0x01'u8) != 0:
+          # 300::/7 addresses belong to a routed /64 subnet. Match Go's
+          # ipv6rwc.sendToSubnet(): use Subnet.GetKey(), i.e. only the first
+          # 64 bits, not the host/interface-id bits.
+          var snet: YggSubnet
+          for i in 0 ..< 8: snet[i] = destAddr[i]
+          destKey = subnetGetKey(snet)
+        else:
+          # 200::/7 node addresses use Address.GetKey() over the full address.
+          destKey = keyPrefixForYggAddress(destAddr)
+        when defined(yggdebug): stderr.writeLine "[dataplane] TUN -> overlay dest=" & toIPv6String(destAddr) & " pktLen=" & $packet.len & " destAddr0=0x" & toHex(destAddr[0]) & " destKey=" & toHex(destKey)
       elif version == 4 and packet.len >= 20:
         continue
       else:
