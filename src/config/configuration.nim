@@ -614,12 +614,12 @@ proc generateReachableConfig*(path: string;
   let allPeers = fetchAllPeers(jsonUrls, githubRepos, onlyUp = true, token = token)
   var selected: seq[PublicPeer]
   for p in allPeers:
-    if p.parsed.kind notin {tkTcp, tkTls, tkQuic, tkWebSocket}: continue
+    if p.parsed.kind notin {tkTcp, tkTls}: continue
     if not canTcpConnect(p.parsed): continue
     selected.add p
     if selected.len >= peerCount: break
   if selected.len == 0:
-    raise newException(IOError, "no reachable TCP/TLS/QUIC/WebSocket public peers found")
+    raise newException(IOError, "no reachable TCP/TLS public peers found")
   writeGeneratedConfig(path, selected, listen, keyfile, tunEnable, proxyEnable,
                        jsonUrls, githubRepos, checkInterval, maxPingMs, cacheFile)
   result = selected.len

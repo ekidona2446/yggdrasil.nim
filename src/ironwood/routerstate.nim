@@ -245,6 +245,7 @@ proc addPeer*(r: var RouterState, remoteKey: NodeId, priority: uint8 = 0): Route
   var p = initIronwoodPeer(id, remoteKey, r.crypto, localPort = port)
   r.peers[id] = p
   r.peerByKey[remoteKey] = id
+  r.portToPeer.del(port)
   r.portToPeer[port] = id
   r.sentAnnounces[id] = @[]
   r.blooms.addPeer(remoteKey)
@@ -591,7 +592,13 @@ proc sendAppData*(r: var RouterState, dest: NodeId, data: openArray[byte]): Rout
     of oaSendToInner: r.routeSessionData(toNodeId(a.dest), a.data, result)
     of oaDeliver: result.deliveries.add AppDelivery(source: toNodeId(a.source), data: a.data)
 
+const
+  MaxTransitPayloadBytes* = 65535 + 256
+
 proc handleTraffic(r: var RouterState, tr: TrafficPacket, step: var RouterStep) =
+  if tr.payload.len > MaxTransitPayloadBytes:
+    step.addEvent(reDecodeError, "oversized traffic payload=" & $tr.payload.len, key = some(tr.dest))
+    return
   if tr.dest == r.crypto.publicKey:
     when defined(yggdebug): stderr.writeLine "[ironwood] handleTraffic FOR US src=" & short(tr.source) & " payloadLen=" & $tr.payload.len & " firstByte=" & (if tr.payload.len > 0: "0x" & toHex(tr.payload[0]) else: "empty") & " fullPayload=" & toHex(tr.payload)
     let acts = r.sessions.handleData(toEdPublic(tr.source), tr.payload)

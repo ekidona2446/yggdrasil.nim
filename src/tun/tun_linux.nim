@@ -257,26 +257,41 @@ proc openTun*(cfg: TunConfig): TunAdapter =
   result.ifName = actual
   result.opened = true
 
+proc shellQuote(s: string): string =
+  result = "'"
+  for c in s:
+    if c == '\'': result.add "'\\''"
+    else: result.add c
+  result.add "'"
+
+proc ipCmd(args: string): int =
+  execShellCmd("ip " & args & " 2>/dev/null")
+
 proc configureInterface*(tun: TunAdapter, ipv6: string, mtu: int = 65535) =
   ## Bring the interface up with the given MTU and Yggdrasil address.
+  ## Assign only the node address as /128.  The 200::/7 network belongs in the
+  ## route table; putting /7 on the address creates an implicit kernel route
+  ## without the required preferred source and breaks return-path selection.
   if not tun.opened: return
-  let name = tun.ifName
-  var cmds: seq[string]
-  cmds.add("link set dev " & name & " mtu " & $mtu)
+  let name = shellQuote(tun.ifName)
+  discard ipCmd("link set dev " & name & " mtu " & $mtu)
   if ipv6.len > 0:
-    cmds.add("-6 address add " & ipv6 & "/7 dev " & name)
-    # Fall back to /128 if /7 is rejected (e.g. route already exists).
-    cmds.add("-6 address add " & ipv6 & "/128 dev " & name)
-  cmds.add("link set dev " & name & " up")
-  for c in cmds:
-    discard execShellCmd("ip " & c & " 2>/dev/null")
+    discard ipCmd("-6 address replace " & shellQuote(ipv6 & "/128") & " dev " & name)
+  discard ipCmd("link set dev " & name & " up")
 
 proc configureRoutes*(tun: TunAdapter) =
-  ## Route the whole Yggdrasil 200::/7 range through the TUN interface.
+  ## Route the whole Yggdrasil 200::/7 range through the TUN interface with the
+  ## node address as preferred source, equivalent to:
+  ##   ip -6 route replace 200::/7 dev ygg0 src <nim-ygg-address>
   if not tun.opened: return
-  let name = tun.ifName
-  discard execShellCmd("ip -6 route add " & YggPrefix & " dev " & name & " 2>/dev/null")
-  discard execShellCmd("ip -6 route replace " & YggPrefix & " dev " & name & " 2>/dev/null")
+  let name = shellQuote(tun.ifName)
+  var src = tun.cfg.ipv6
+  if src.contains("/"):
+    src = src.split('/')[0]
+  if src.len > 0:
+    discard ipCmd("-6 route replace " & YggPrefix & " dev " & name & " src " & shellQuote(src))
+  else:
+    discard ipCmd("-6 route replace " & YggPrefix & " dev " & name)
 
 proc startIo*(tun: TunAdapter) =
   ## Start the background I/O threads and the Chronos transport. Must be called

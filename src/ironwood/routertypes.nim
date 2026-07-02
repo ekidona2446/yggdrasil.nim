@@ -17,6 +17,7 @@ type
     kind*: RouterMessageKind
     peerId*: PeerId
     peerKey*: NodeId
+    peerPort*: PeerPort  ## Local ironwood port to remove from portToPeer on disconnect
     frame*: Frame
     traffic*: TrafficPacket
     priority*: uint8     ## Peer priority for addPeer

@@ -53,16 +53,22 @@ proc mtu*(pc: PacketConn): uint64 =
 proc localAddr*(pc: PacketConn): NodeId =
   pc.crypto.publicKey
 
+const
+  MaxPendingOutboundPerPeer* = 256
+
 proc dispatchOutbound(pc: PacketConn, step: RouterStep) =
   for action in step.outbound:
     if pc.peers.hasKey(action.peerId):
       pc.peers[action.peerId].sendFrame(action.frame)
     else:
       # Peer's AsyncPeer not registered yet (addPeer via channel race).
-      # Buffer the frame; it will be flushed once handleConn creates the peer.
+      # Buffer only a small bounded amount; transit bursts can otherwise keep
+      # appending frames for a peer that is reconnecting/failed and grow RSS
+      # until OOM.  Dropping here matches sendFrame() backpressure semantics.
       if not pc.pendingOutbound.hasKey(action.peerId):
         pc.pendingOutbound[action.peerId] = @[]
-      pc.pendingOutbound[action.peerId].add(action.frame)
+      if pc.pendingOutbound[action.peerId].len < MaxPendingOutboundPerPeer:
+        pc.pendingOutbound[action.peerId].add(action.frame)
 
 proc dispatchDeliveries(pc: PacketConn, step: RouterStep) =
   for d in step.deliveries:
@@ -92,7 +98,11 @@ proc processRouterMessage(pc: PacketConn, msg: RouterMessage) =
         if pc.state.peerByKey.hasKey(msg.peerKey) and
            pc.state.peerByKey[msg.peerKey] == msg.peerId:
           pc.state.peerByKey.del(msg.peerKey)
+        if pc.state.portToPeer.hasKey(msg.peerPort) and
+           pc.state.portToPeer[msg.peerPort] == msg.peerId:
+          pc.state.portToPeer.del(msg.peerPort)
         pc.state.sentAnnounces.del(msg.peerId)
+        pc.pendingOutbound.del(msg.peerId)
         pc.state.blooms.removePeer(msg.peerKey)
       of rmHandleFrame:
         if pc.state.peers.hasKey(msg.peerId):
@@ -234,6 +244,11 @@ proc handleConn*(pc: PacketConn, peerKey: NodeId, transport: StreamTransport,
   if pid == 0:
     raise newException(ValueError, "peer not registered after addPeer")
   
+  var localPort: PeerPort = 0
+  {.cast(gcsafe).}:
+    if pc.state.peers.hasKey(pid):
+      localPort = pc.state.peers[pid].localPort
+
   if pc.peers.hasKey(pid):
     let oldPeer = pc.peers[pid]
     oldPeer.close()
@@ -257,7 +272,7 @@ proc handleConn*(pc: PacketConn, peerKey: NodeId, transport: StreamTransport,
     pc.peers.del(pid)
     if pc.peerByKey.hasKey(peerKey) and pc.peerByKey[peerKey] == pid:
       pc.peerByKey.del(peerKey)
-    let rmMsg = RouterMessage(kind: rmRemovePeer, peerId: pid, peerKey: peerKey)
+    let rmMsg = RouterMessage(kind: rmRemovePeer, peerId: pid, peerKey: peerKey, peerPort: localPort)
     try:
       pc.routerChan.addLastNoWait(rmMsg)
     except AsyncQueueFullError:
@@ -283,6 +298,11 @@ proc handleConnStream*(pc: PacketConn, peerKey: NodeId,
   if pid == 0:
     raise newException(ValueError, "peer not registered after addPeer")
   
+  var localPort: PeerPort = 0
+  {.cast(gcsafe).}:
+    if pc.state.peers.hasKey(pid):
+      localPort = pc.state.peers[pid].localPort
+
   if pc.peers.hasKey(pid):
     let oldPeer = pc.peers[pid]
     oldPeer.close()
@@ -305,7 +325,7 @@ proc handleConnStream*(pc: PacketConn, peerKey: NodeId,
     pc.peers.del(pid)
     if pc.peerByKey.hasKey(peerKey) and pc.peerByKey[peerKey] == pid:
       pc.peerByKey.del(peerKey)
-    let rmMsg = RouterMessage(kind: rmRemovePeer, peerId: pid, peerKey: peerKey)
+    let rmMsg = RouterMessage(kind: rmRemovePeer, peerId: pid, peerKey: peerKey, peerPort: localPort)
     try:
       pc.routerChan.addLastNoWait(rmMsg)
     except AsyncQueueFullError:

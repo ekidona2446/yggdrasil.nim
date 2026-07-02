@@ -10,7 +10,7 @@
 ## - Admin socket (JSON-RPC)
 ## - DNS resolver
 
-import std/[os, parseopt, strutils, options, sequtils]
+import std/[os, parseopt, strutils, options, sequtils, tables]
 import chronos
 import toml_serialization
 import toml_serialization/lexer
@@ -118,6 +118,58 @@ proc overlayToTun(pc: PacketConn, tun: TunAdapter) {.async.} =
     except CatchableError as e:
       if not tun.running: break
       await sleepAsync(chronos.milliseconds(1))
+
+
+proc discoverConfiguredPublicPeers(cfg: AppConfig; maxPeers = 8): seq[string] =
+  ## Refresh public peers from configured JSON/GitHub sources and return a small
+  ## reachable TCP/TLS set for this daemon run.  QUIC/WS are intentionally not
+  ## auto-selected yet because their transports are still being completed.
+  if cfg.peers.publicPeerLists.len == 0 and cfg.peers.githubPeerRepos.len == 0:
+    return @[]
+
+  proc fromCache(): seq[string] =
+    if cfg.peers.peerCacheFile.len == 0: return @[]
+    for c in loadPeerCache(cfg.peers.peerCacheFile):
+      try:
+        let p = parsePeerUri(c.uri)
+        if p.kind in {tkTcp, tkTls}:
+          result.add c.uri
+          if result.len >= maxPeers: break
+      except CatchableError:
+        discard
+
+  let interval = parsePeerCheckInterval(cfg.peers.peerCheckInterval)
+  let cacheFresh = cfg.peers.peerCacheFile.len > 0 and
+                   not shouldRefreshCache(cfg.peers.peerCacheFile, interval)
+  if cacheFresh:
+    result = fromCache()
+    if result.len > 0:
+      echo "Public peers: loaded ", result.len, " from fresh cache ", cfg.peers.peerCacheFile
+      return
+
+  try:
+    let allPeers = fetchAllPeers(cfg.peers.publicPeerLists, cfg.peers.githubPeerRepos, onlyUp = true)
+    echo "Public peers: fetched ", allPeers.len, " candidates from configured sources"
+    var selected: seq[PublicPeer]
+    for p in allPeers:
+      if p.parsed.kind notin {tkTcp, tkTls}: continue
+      if not canTcpConnect(p.parsed, timeoutMs = 2500): continue
+      selected.add p
+      result.add p.uri
+      if result.len >= maxPeers: break
+    if selected.len > 0:
+      if cfg.peers.peerCacheFile.len > 0:
+        var ping = initTable[string, int]()
+        savePeerCache(cfg.peers.peerCacheFile, selected, ping)
+        echo "Public peers: saved ", selected.len, " reachable peers to ", cfg.peers.peerCacheFile
+      return
+    echo "Public peers: no reachable TCP/TLS peers found, trying cache"
+  except CatchableError as e:
+    echo "Public peers: refresh failed: ", e.msg, "; trying cache"
+
+  result = fromCache()
+  if result.len > 0:
+    echo "Public peers: loaded ", result.len, " peers from stale cache"
 
 # ── Async daemon ──────────────────────────────────────────────────────────
 
@@ -368,6 +420,41 @@ proc main() =
     echo "added ", dnsToAdd.len, " DNS upstream(s) to ", configPath
     return
 
+  if generateConfigPath.len > 0:
+    if peerCount <= 0: quit "--peer-count must be positive", 2
+    let listen  = if socks5Addr.len > 0: socks5Addr else: "[::1]:1080"
+    let keyfile = if keyOverride.len > 0: keyOverride else: "yggdrasil.key"
+    try:
+      discard loadOrCreateRouterCrypto(keyfile)
+    except CatchableError as e:
+      quit "could not create keyfile " & keyfile & ": " & e.msg, 1
+    var tunEnable  = true
+    var proxyEnable = false
+    if modeTunOnly:
+      tunEnable = true; proxyEnable = false
+    elif modeTunProxy:
+      tunEnable = true; proxyEnable = true
+    elif modeProxyOnly:
+      tunEnable = false; proxyEnable = true
+    var jsonUrls:    seq[string]
+    var githubRepos: seq[string]
+    if publicPeersSource.len > 0:
+      if publicPeersSource.startsWith("http") or fileExists(publicPeersSource):
+        jsonUrls.add publicPeersSource
+      else:
+        githubRepos.add publicPeersSource
+    else:
+      # Default source for the convenience CLI path.  Normal daemon operation
+      # still uses only the sources explicitly present in the config file.
+      jsonUrls.add "https://publicpeers.neilalexander.dev/publicnodes.json"
+    let n = configuration.generateReachableConfig(
+      generateConfigPath, jsonUrls, githubRepos,
+      peerCount, listen, keyfile, tunEnable, proxyEnable)
+    echo "generated ", generateConfigPath, " with ", n,
+         " reachable public peers; tun=", tunEnable,
+         " proxy=", proxyEnable, " proxy listen=", listen
+    return
+
   if publicPeersSource.len > 0:
     # --check-public-peers accepts either a JSON URL/file or a GitHub "owner/repo" slug
     var peers: seq[PublicPeer]
@@ -387,40 +474,6 @@ proc main() =
       echo p.uri, " region=", p.region, " up=", p.up, " responseMs=", p.responseMs
     return
 
-  if generateConfigPath.len > 0:
-    if peerCount <= 0: quit "--peer-count must be positive", 2
-    let listen  = if socks5Addr.len > 0: socks5Addr else: "[::1]:1080"
-    let keyfile = if keyOverride.len > 0: keyOverride else: "yggdrasil.key"
-    try:
-      discard loadOrCreateRouterCrypto(keyfile)
-    except CatchableError as e:
-      quit "could not create keyfile " & keyfile & ": " & e.msg, 1
-    # Default generated config is TUN-first.  Use --generate-proxy-config or
-    # --proxy-mode for the old proxy-only behaviour, and --tun-proxy-mode for both.
-    var tunEnable  = true
-    var proxyEnable = false
-    if modeTunOnly:
-      tunEnable = true; proxyEnable = false
-    elif modeTunProxy:
-      tunEnable = true; proxyEnable = true
-    elif modeProxyOnly:
-      tunEnable = false; proxyEnable = true
-    # Build source lists from CLI flags or fall back to config-file values
-    var jsonUrls:    seq[string]
-    var githubRepos: seq[string]
-    if publicPeersSource.len > 0:
-      if publicPeersSource.startsWith("http") or fileExists(publicPeersSource):
-        jsonUrls.add publicPeersSource
-      else:
-        githubRepos.add publicPeersSource
-    # If nothing provided, the function will raise – let the error propagate
-    let n = configuration.generateReachableConfig(
-      generateConfigPath, jsonUrls, githubRepos,
-      peerCount, listen, keyfile, tunEnable, proxyEnable)
-    echo "generated ", generateConfigPath, " with ", n,
-         " reachable public peers; tun=", tunEnable,
-         " proxy=", proxyEnable, " proxy listen=", listen
-    return
 
   echo "loading config from: ", configPath
   # Load config
@@ -439,8 +492,13 @@ proc main() =
   if socks5Addr.len > 0: cfg.proxy.listen = socks5Addr
   if noTun: cfg.tun.enable = false
 
-  # Merge CLI peer URIs with config
-  if peerUris.len == 0: peerUris = cfg.peers.staticPeers
+  # Merge CLI peer URIs with config and refresh public peer sources if configured.
+  if peerUris.len == 0:
+    peerUris = cfg.peers.staticPeers
+    let discovered = discoverConfiguredPublicPeers(cfg, maxPeers = 8)
+    for uri in discovered:
+      if uri notin peerUris:
+        peerUris.add uri
   if listenAddrs.len == 0:
     if cfg.admin.listen.len > 0:
       for a in cfg.admin.listen:

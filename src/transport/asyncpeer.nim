@@ -16,6 +16,7 @@ import ../ironwood/routertypes
 
 const
   PeerWriterQueueSize* = 512
+  RouterBackpressureTimeoutMs* = 1000
   MaxFrameSize* = 1_048_576   ## 1 MiB max frame size
   WriteTimeoutMs* = 10_000    ## 10s write timeout
   KeepaliveIntervalMs* = 60_000  ## 60s idle keepalive
@@ -134,7 +135,14 @@ proc readerLoop(peer: AsyncPeer) {.async.} =
       try:
         peer.routerChan.addLastNoWait(msg)
       except AsyncQueueFullError:
-        asyncSpawn peer.routerChan.addLast(msg)
+        # Apply backpressure to the peer reader instead of spawning an
+        # unbounded number of addLast() futures.  The old asyncSpawn path was
+        # the main OOM amplifier under transit traffic: every full router queue
+        # allocated a suspended future that retained the full frame payload.
+        try:
+          await peer.routerChan.addLast(msg).wait(chronos.milliseconds(RouterBackpressureTimeoutMs))
+        except CatchableError:
+          discard
     except CancelledError:
       break
     except CatchableError as e:
@@ -149,28 +157,33 @@ proc writerLoop(peer: AsyncPeer) {.async.} =
     let sleepFut = sleepAsync(chronos.milliseconds(KeepaliveIntervalMs))
     let recvFut = if pendingRecv != nil: pendingRecv else: peer.writerQueue.popFirst()
     pendingRecv = nil
-    let completed = await race(recvFut, sleepFut)
-    
-    if completed == recvFut:
-      if not sleepFut.finished: sleepFut.cancelSoon()
+    try:
+      let completed = await race(recvFut, sleepFut)
+      if completed != recvFut:
+        pendingRecv = recvFut
+        try:
+          await peer.writer.write(keepalive)
+        except CatchableError:
+          break
+        continue
+    except CancelledError:
+      break
+    except CatchableError:
+      break
+
+    if not sleepFut.finished: sleepFut.cancelSoon()
+    try:
       let frameData = recvFut.read()
-      try:
-        var ptOff = 0
-        while ptOff < frameData.len and (frameData[ptOff] and 0x80) != 0: ptOff.inc
-        ptOff.inc
-        let pType = if ptOff < frameData.len: frameData[ptOff] else: 0'u8
-        if pType in {5'u8, 6'u8, 7'u8, 9'u8}:
-          when defined(yggdebug): stderr.writeLine "[asyncpeer] WRITE type=" & $pType & " len=" & $frameData.len & " peer=" & short(peer.remoteKey)
-        await peer.writer.write(frameData)
-      except CatchableError as e:
-        when defined(yggdebug): stderr.writeLine "[asyncpeer] writer error peer=" & short(peer.remoteKey) & ": " & e.msg
-        break
-    else:
-      pendingRecv = recvFut
-      try:
-        await peer.writer.write(keepalive)
-      except CatchableError:
-        break
+      var ptOff = 0
+      while ptOff < frameData.len and (frameData[ptOff] and 0x80) != 0: ptOff.inc
+      ptOff.inc
+      let pType = if ptOff < frameData.len: frameData[ptOff] else: 0'u8
+      if pType in {5'u8, 6'u8, 7'u8, 9'u8}:
+        when defined(yggdebug): stderr.writeLine "[asyncpeer] WRITE type=" & $pType & " len=" & $frameData.len & " peer=" & short(peer.remoteKey)
+      await peer.writer.write(frameData)
+    except CatchableError as e:
+      when defined(yggdebug): stderr.writeLine "[asyncpeer] writer error peer=" & short(peer.remoteKey) & ": " & e.msg
+      break
   if pendingRecv != nil and not pendingRecv.finished:
     pendingRecv.cancelSoon()
 
