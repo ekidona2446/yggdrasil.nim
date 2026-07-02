@@ -168,7 +168,7 @@ proc platformDefaults*(): tuple[adminListen: string, tunName: string, tunMtu: in
   elif defined(windows):
     ("tcp://127.0.0.1:9001", "Yggdrasil", 65535)
   else:
-    ("tcp://127.0.0.1:9001", "ygg0", 1280)
+    ("tcp://127.0.0.1:9001", "ygg0", 65535)
 
 # =============================================================================
 # Default configuration
@@ -219,7 +219,7 @@ proc defaultConfig*(): AppConfig =
     enable: true,
     listen: "[::1]:5053",
     hostsFile: "hosts",
-    upstream: @["1.1.1.1:53", "8.8.8.8:53"]
+    upstream: @[]
   )
 
   result.admin = AdminConfig(
@@ -619,7 +619,7 @@ proc generateReachableConfig*(path: string;
     selected.add p
     if selected.len >= peerCount: break
   if selected.len == 0:
-    raise newException(IOError, "no reachable TCP/TLS public peers found")
+    raise newException(IOError, "no reachable public peers found")
   writeGeneratedConfig(path, selected, listen, keyfile, tunEnable, proxyEnable,
                        jsonUrls, githubRepos, checkInterval, maxPingMs, cacheFile)
   result = selected.len

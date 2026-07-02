@@ -98,19 +98,27 @@ proc parsePeerUri*(uri: string): PeerUri =
           except ValueError: discard
         else: discard
     return
-  if hostPortAndPath.startsWith("["):
-    let close = hostPortAndPath.find(']')
+  # Split optional path before parsing host:port. This is required for ws/wss
+  # URLs such as ws://host:port/path; other stream transports simply ignore it.
+  var hostPort = hostPortAndPath
+  let slashPos = hostPortAndPath.find('/')
+  if slashPos >= 0:
+    hostPort = hostPortAndPath[0 ..< slashPos]
+    result.path = hostPortAndPath[slashPos .. ^1]
+
+  if hostPort.startsWith("["):
+    let close = hostPort.find(']')
     if close < 0: raise newException(ValueError, "invalid bracketed IPv6 peer URI")
-    result.host = hostPortAndPath[1 ..< close]
-    if close + 1 < hostPortAndPath.len and hostPortAndPath[close + 1] == ':':
-      result.port = parseInt(hostPortAndPath[close + 2 .. ^1])
+    result.host = hostPort[1 ..< close]
+    if close + 1 < hostPort.len and hostPort[close + 1] == ':':
+      result.port = parseInt(hostPort[close + 2 .. ^1])
     else:
       raise newException(ValueError, "peer URI missing port: " & uri)
   else:
-    let colon = hostPortAndPath.rfind(':')
+    let colon = hostPort.rfind(':')
     if colon < 0: raise newException(ValueError, "peer URI missing port: " & uri)
-    result.host = hostPortAndPath[0 ..< colon]
-    result.port = parseInt(hostPortAndPath[colon + 1 .. ^1])
+    result.host = hostPort[0 ..< colon]
+    result.port = parseInt(hostPort[colon + 1 .. ^1])
   if result.host.len == 0: raise newException(ValueError, "peer URI host is empty")
   if result.port <= 0 or result.port > 65535: raise newException(ValueError, "peer URI port out of range")
   # Parse query parameters

@@ -284,6 +284,9 @@ type
     servers*: seq[StreamServer]
     dialFuts*: seq[Future[void]]
     tlsBridges*: seq[TlsBridgeState]
+    wsBridges*: seq[WsBridgeState]
+    quicBridges*: seq[QuicBridgeState]
+    quicMgr*: QuicManager
     running*: bool
 
 proc newLinkManager*(crypto: RouterCrypto, packetConn: PacketConn,
@@ -546,61 +549,108 @@ proc dialSocksPeer(manager: LinkManager, uri: string, parsed: PeerUri) {.async.}
     backoffMs = min(backoffMs * 2, maxBackoff)
 
 proc dialWsPeer(manager: LinkManager, uri: string, parsed: PeerUri) {.async.} =
-  ## Dial WebSocket peer using nim-websock.
+  ## Dial WebSocket/WSS peer.  Matches yggdrasil-go's link_ws/link_wss:
+  ## RFC6455 binary frames with Sec-WebSocket-Protocol: ygg-ws, then the normal
+  ## Yggdrasil metadata handshake runs over the WebSocket byte stream.
   var backoffMs = 1000
   let maxBackoff = if parsed.maxBackoff > 0: parsed.maxBackoff * 1000 else: DefaultMaxBackoffMs
   let priority = parsed.priority
   let password = if parsed.password.len > 0: parsed.password.mapIt(byte(it)) else: manager.config.password
   let wsPath = if parsed.path.len > 0: parsed.path else: "/"
+  let secure = parsed.scheme == "wss"
+  let sni = resolveSni(parsed)
 
   while manager.running:
+    var bridgeState: WsBridgeState = nil
     try:
       let hosts = resolveHost(parsed.host)
       var connected = false
       for host in hosts:
-        try:
-          let ws = if parsed.kind == tkWebSocket and parsed.scheme == "wss":
-                     await dialWss(host, parsed.port, wsPath)
-                   else:
-                     await dialWs(host, parsed.port, wsPath)
-
-          # TODO: wrap WebSocket into StreamTransport or handle directly
-          # For now we just log success
-          echo "[WS] Connected to ", host, ":", parsed.port, " (", parsed.scheme, ")"
-          connected = true
-          # In real implementation: convert ws to transport and do meta handshake
-          break
-        except CatchableError as e:
-          echo "[WS] connection error to ", host, ": ", e.msg
+        let br = await createWsBridge(WsBridgeConfig(
+          host: parsed.host,
+          connectHost: host,
+          port: parsed.port,
+          path: wsPath,
+          secure: secure,
+          sni: sni,
+          timeoutMs: HandshakeTimeoutMs,
+        ))
+        if br.isNone:
           continue
-
-      if not connected:
-        echo "[WS] Failed to connect to ", uri
-    except CatchableError as e:
-      echo "[WS] dial error ", uri, ": ", e.msg
-
+        let (state, transp) = br.get()
+        bridgeState = state
+        manager.wsBridges.add(state)
+        try:
+          let remoteKey = await doClientHandshake(transp, manager.crypto, priority, password)
+          if remoteKey == manager.crypto.publicKey:
+            transp.close()
+            state.close()
+            continue
+          echo "connected (", parsed.scheme, ") to ", short(remoteKey), " via ", uri
+          backoffMs = 1000
+          connected = true
+          await manager.packetConn.handleConn(remoteKey, transp, priority)
+          echo "disconnected (", parsed.scheme, ") from ", short(remoteKey)
+        except Exception as e:
+          echo "WS+meta error with ", uri, ": ", e.msg
+          try: transp.close()
+          except Exception: discard
+          state.close()
+        break
+      if not connected and bridgeState == nil:
+        echo "WS dial error ", uri, ": all addresses failed"
+    except Exception as e:
+      echo "WS dial error ", uri, ": ", e.msg
+      if bridgeState != nil: bridgeState.close()
     await sleepAsync(chronos.milliseconds(backoffMs))
     backoffMs = min(backoffMs * 2, maxBackoff)
 
 proc dialQuicPeer(manager: LinkManager, uri: string, parsed: PeerUri) {.async.} =
-  ## Dial QUIC peer using nim-lsquic.
+  ## Dial QUIC peer using nim-lsquic.  Opens one bidirectional stream and runs
+  ## the normal Yggdrasil metadata handshake over it.
   var backoffMs = 1000
   let maxBackoff = if parsed.maxBackoff > 0: parsed.maxBackoff * 1000 else: DefaultMaxBackoffMs
+  let priority = parsed.priority
+  let password = if parsed.password.len > 0: parsed.password.mapIt(byte(it)) else: manager.config.password
+
+  if manager.quicMgr.isNil:
+    manager.quicMgr = newQuicManager(manager.crypto)
+    manager.quicMgr.setupQuicManager()
 
   while manager.running:
+    var bridgeState: QuicBridgeState = nil
     try:
-      # Create a QuicManager if needed
-      var qmgr = newQuicManager(manager.crypto)
-      qmgr.setupQuicManager()
-
-      let peerConn = await qmgr.dialQuicPeer(parsed)
-      if peerConn.connected:
-        echo "[QUIC] Successfully dialed ", uri
-        # TODO: perform metadata handshake over QUIC stream and register with PacketConn
-      else:
-        echo "[QUIC] Failed to dial ", uri
-    except CatchableError as e:
-      echo "[QUIC] error dialing ", uri, ": ", e.msg
+      let hosts = resolveHost(parsed.host)
+      var connected = false
+      for host in hosts:
+        let br = await manager.quicMgr.createQuicBridge(host, parsed.port, HandshakeTimeoutMs)
+        if br.isNone:
+          continue
+        let (state, transp) = br.get()
+        bridgeState = state
+        manager.quicBridges.add(state)
+        try:
+          let remoteKey = await doClientHandshake(transp, manager.crypto, priority, password)
+          if remoteKey == manager.crypto.publicKey:
+            transp.close()
+            state.close()
+            continue
+          echo "connected (QUIC) to ", short(remoteKey), " via ", uri
+          backoffMs = 1000
+          connected = true
+          await manager.packetConn.handleConn(remoteKey, transp, priority)
+          echo "disconnected (QUIC) from ", short(remoteKey)
+        except Exception as e:
+          echo "QUIC+meta error with ", uri, ": ", e.msg
+          try: transp.close()
+          except Exception: discard
+          state.close()
+        break
+      if not connected and bridgeState == nil:
+        echo "QUIC dial error ", uri, ": all addresses failed"
+    except Exception as e:
+      echo "QUIC dial error ", uri, ": ", e.msg
+      if bridgeState != nil: bridgeState.close()
 
     await sleepAsync(chronos.milliseconds(backoffMs))
     backoffMs = min(backoffMs * 2, maxBackoff)
@@ -670,3 +720,9 @@ proc stop*(manager: LinkManager) {.async.} =
     for bridge in manager.tlsBridges:
       bridge.close()
     manager.tlsBridges.setLen(0)
+  for bridge in manager.wsBridges:
+    bridge.close()
+  manager.wsBridges.setLen(0)
+  for bridge in manager.quicBridges:
+    bridge.close()
+  manager.quicBridges.setLen(0)
